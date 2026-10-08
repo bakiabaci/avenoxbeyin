@@ -1,5 +1,6 @@
 """Receipt coverage ratio tests (Issue #78)."""
 from datetime import datetime, timezone
+from unittest.mock import patch
 import json
 import os
 from pathlib import Path
@@ -242,11 +243,9 @@ class ReceiptCoverageTest(unittest.TestCase):
 
     def test_receipt_after_prompt_at_covers_session_despite_late_conversational_turn(self):
         """Late conversational turns (e.g. 'thanks', 'status') after receipt was written do not un-cover the session (Issue #212)."""
-        import hashlib
         engine = SyncEngine(self.vault, self.state)
         now = time.time()
         sess_id = 'sess_late_turn'
-        sess_hashed = hashlib.sha256(sess_id.encode('utf-8')).hexdigest()[:24]
 
         # 1. User starts prompt at now - 100
         self._enqueue('SessionStart', sess_id, at=now - 100)
@@ -254,12 +253,17 @@ class ReceiptCoverageTest(unittest.TestCase):
 
         # 2. Receipt generated at now - 50 (after prompt_at, before late turn)
         engine.note_create('notes/task.md', 'Work completed.', {'id': 'task-1'})
-        engine.receipt('evt_task', 'Completed work', ['notes/task.md'], 'claude', session=sess_id)
-        # Manually backdate receipt created_at to now - 50
-        later = datetime.fromtimestamp(now - 50, timezone.utc).isoformat().replace('+00:00', 'Z')
-        with engine.store._connect() as db:
-            db.execute("UPDATE receipts SET payload = json_set(payload, '$.created_at', ?) WHERE id = 'evt_task'", (later,))
+        # Stamp the authoritative Markdown and SQLite together; sync must not restore
+        # a newer on-disk timestamp and make the old threshold falsely pass.
+        receipt_time = datetime.fromtimestamp(now - 50, timezone.utc)
+        with patch('beyin_v3_sync.datetime', wraps=datetime) as clock:
+            clock.now.return_value = receipt_time
+            engine.receipt('evt_task', 'Completed work', ['notes/task.md'], 'claude', session=sess_id)
         engine.sync()
+        with engine.store._connect() as db:
+            event = json.loads(db.execute("SELECT payload FROM receipts WHERE id='evt_task'").fetchone()[0])
+        # datetime serializes microseconds; time.time() may carry finer precision.
+        self.assertAlmostEqual(datetime.fromisoformat(event['created_at']).timestamp(), now - 50, delta=0.000001)
 
         # 3. User says "thanks!" at now - 20 (turn_at becomes now - 20, later than receipt created_at)
         self._enqueue('UserPromptSubmit', sess_id, at=now - 20)
@@ -297,6 +301,86 @@ class ReceiptCoverageTest(unittest.TestCase):
         # Verify no .edited marker created
         folder = self.state / 'receipt-reminders'
         self.assertFalse(any(p.name.endswith('.edited') for p in folder.glob('*')))
+
+    def test_followup_diagnostic_is_separate_from_missing_in_all_windows(self):
+        from beyin_v3_projections import record_checkpoints, refresh_gaps
+        engine = SyncEngine(self.vault, self.state)
+        now = time.time()
+        record_checkpoints(engine, [
+            {'event': 'UserPromptSubmit', 'harness': 'claude', 'session': 'followup', 'at': now - 100},
+            {'event': 'UserPromptSubmit', 'harness': 'claude', 'session': 'followup', 'at': now - 20},
+            {'event': 'Stop', 'harness': 'claude', 'session': 'followup', 'at': now - 10},
+        ])
+        with engine.store._connect() as db:
+            db.execute('INSERT INTO receipts VALUES (?,?)', ('followup', json.dumps({
+                'harness': 'claude', 'session': 'followup',
+                'created_at': datetime.fromtimestamp(now - 50, timezone.utc).isoformat()})))
+            refresh_gaps(engine, db)
+            cov = receipt_coverage(db, now=now)
+        gaps = json.loads((self.state / 'receipt-gaps.json').read_text(encoding='utf-8'))
+        self.assertEqual(gaps['potential_missing_receipts'], 0)
+        for counts in (cov, cov['last_7d'], cov['last_30d'], gaps['receipt_coverage']):
+            self.assertEqual((counts['covered'], counts['missing'], counts['receipt_before_last_prompt']), (1, 0, 1))
+        cmd = [sys.executable, str(ROOT / 'scripts/beyin_v3.py'), '--vault', str(self.vault),
+               '--state', str(self.state), 'doctor']
+        doctor = json.loads(subprocess.run(cmd, capture_output=True, text=True, check=True).stdout)
+        self.assertEqual(doctor['receipt_coverage']['receipt_before_last_prompt'], 1)
+
+    def test_out_of_order_prompt_preserves_earliest_boundary(self):
+        from beyin_v3_projections import record_checkpoints
+        engine = SyncEngine(self.vault, self.state)
+        record_checkpoints(engine, [{'event': 'UserPromptSubmit', 'harness': 'claude', 'session': 'late', 'at': 200}])
+        record_checkpoints(engine, [
+            {'event': 'UserPromptSubmit', 'harness': 'claude', 'session': 'late', 'at': 100},
+            {'event': 'UserPromptSubmit', 'harness': 'claude', 'session': 'late', 'at': 300},
+            {'event': 'Stop', 'harness': 'claude', 'session': 'late', 'at': 400},
+        ])
+        with engine.store._connect() as db:
+            row = db.execute('SELECT prompt_at,turn_at FROM receipt_checkpoints').fetchone()
+            self.assertEqual(tuple(row), (100, 300))
+            db.execute('INSERT INTO receipts VALUES (?,?)', ('late', json.dumps({
+                'harness': 'claude', 'session': 'late',
+                'created_at': datetime.fromtimestamp(150, timezone.utc).isoformat()})))
+            self.assertEqual(receipt_coverage(db, now=500)['covered'], 1)
+
+    @unittest.skipUnless(hasattr(time, 'tzset'), 'Changing the process timezone requires tzset')
+    def test_naive_receipt_is_utc_in_every_local_timezone(self):
+        from beyin_v3_projections import record_checkpoints
+        engine = SyncEngine(self.vault, self.state)
+        stamp = datetime(2026, 10, 8, 12, tzinfo=timezone.utc)
+        record_checkpoints(engine, [
+            {'event': 'UserPromptSubmit', 'harness': 'claude', 'session': 'naive', 'at': stamp.timestamp() - 10},
+            {'event': 'Stop', 'harness': 'claude', 'session': 'naive', 'at': stamp.timestamp() + 10},
+        ])
+        with engine.store._connect() as db:
+            db.execute('INSERT INTO receipts VALUES (?,?)', ('naive', json.dumps({
+                'harness': 'claude', 'session': 'naive', 'created_at': stamp.replace(tzinfo=None).isoformat()})))
+            try:
+                for zone in ('UTC0', 'UTC-3'):
+                    with patch.dict(os.environ, {'TZ': zone}):
+                        time.tzset()
+                        self.assertEqual(receipt_coverage(db, now=stamp.timestamp() + 20)['covered'], 1)
+            finally:
+                time.tzset()
+
+    def test_later_receipt_clears_diagnostic_and_wrong_harness_stays_missing(self):
+        from beyin_v3_projections import record_checkpoints
+        engine = SyncEngine(self.vault, self.state)
+        for session in ('updated', 'wrong'):
+            record_checkpoints(engine, [
+                {'event': 'UserPromptSubmit', 'harness': 'claude', 'session': session, 'at': 100},
+                {'event': 'UserPromptSubmit', 'harness': 'claude', 'session': session, 'at': 200},
+                {'event': 'Stop', 'harness': 'claude', 'session': session, 'at': 300},
+            ])
+        with engine.store._connect() as db:
+            for ident, harness, session, stamp in (
+                    ('early', 'claude', 'updated', 150), ('new', 'claude', 'updated', 200),
+                    ('other', 'codex', 'wrong', 250)):
+                db.execute('INSERT INTO receipts VALUES (?,?)', (ident, json.dumps({
+                    'harness': harness, 'session': session,
+                    'created_at': datetime.fromtimestamp(stamp, timezone.utc).isoformat()})))
+            cov = receipt_coverage(db, now=400)
+        self.assertEqual((cov['covered'], cov['missing'], cov['receipt_before_last_prompt']), (1, 1, 0))
 
 
 if __name__ == '__main__':
