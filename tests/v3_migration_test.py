@@ -154,7 +154,7 @@ class MigrationTest(unittest.TestCase):
         engine.sync()
         self.assertEqual(json.loads((self.state/'receipt-gaps.json').read_text())['potential_missing_receipts'], 0)
 
-    def test_prior_turn_receipt_does_not_cover_next_turn(self):
+    def test_prior_turn_receipt_covers_session_but_reports_later_prompt(self):
         from beyin_v3_sync import SyncEngine
         from beyin_v3_projections import record_checkpoints
         import time
@@ -164,7 +164,10 @@ class MigrationTest(unittest.TestCase):
         engine.receipt('turn-one', 'First outcome.', ['notes/example.md'], 'codex', session='same')
         record_checkpoints(engine, [{'event': 'UserPromptSubmit', 'harness': 'codex', 'session': 'same', 'at': time.time()+1}, {'event': 'Stop', 'harness': 'codex', 'session': 'same', 'at': time.time()+2}])
         engine.sync()
-        self.assertEqual(json.loads((self.state/'receipt-gaps.json').read_text())['potential_missing_receipts'], 1)
+        gaps = json.loads((self.state/'receipt-gaps.json').read_text())
+        self.assertEqual(gaps['potential_missing_receipts'], 0)
+        self.assertEqual(gaps['receipt_coverage']['covered'], 1)
+        self.assertEqual(gaps['receipt_coverage']['receipt_before_last_prompt'], 1)
 
     def install_manifest(self, *kept):
         self.state.mkdir(parents=True, exist_ok=True)

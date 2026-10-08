@@ -159,7 +159,7 @@ def record_checkpoints(engine, events):
                 continue
             values = (event['harness'], event['session'], event['at'])
             if event.get('event') == 'UserPromptSubmit' or (event.get('event') == 'SessionStart' and event.get('prompted')):
-                db.execute('INSERT INTO receipt_checkpoints(harness,session,at,turn_at,prompt_at) VALUES (?,?,0,?,?) ON CONFLICT(harness,session) DO UPDATE SET turn_at=MAX(turn_at,excluded.turn_at), prompt_at=CASE WHEN prompt_at > 0 THEN prompt_at ELSE excluded.prompt_at END',
+                db.execute('INSERT INTO receipt_checkpoints(harness,session,at,turn_at,prompt_at) VALUES (?,?,0,?,?) ON CONFLICT(harness,session) DO UPDATE SET turn_at=MAX(turn_at,excluded.turn_at), prompt_at=CASE WHEN prompt_at > 0 THEN MIN(prompt_at,excluded.prompt_at) ELSE excluded.prompt_at END',
                            (event['harness'], event['session'], event['at'], event['at']))
             elif event.get('event') == 'SessionStart':
                 db.execute('INSERT INTO receipt_checkpoints(harness,session,at,turn_at) VALUES (?,?,0,?) ON CONFLICT(harness,session) DO UPDATE SET turn_at=MAX(turn_at,excluded.turn_at)', values)
@@ -176,7 +176,10 @@ def _latest_receipts(db):
     for (payload,) in db.execute('SELECT payload FROM receipts'):
         try:
             receipt = json.loads(payload)
-            created = datetime.fromisoformat(receipt['created_at']).timestamp()
+            instant = _receipt_instant(receipt['created_at'])
+            if instant is None:
+                continue
+            created = instant.timestamp()
         except (KeyError, TypeError, ValueError, OverflowError, OSError):
             continue
         key = (receipt.get('harness'), receipt.get('session'))
@@ -185,6 +188,7 @@ def _latest_receipts(db):
 
 
 def receipt_coverage(db, now=None):
+    """Session receipt presence, not proof that each later edit was recorded."""
     if now is None:
         now = time.time()
     seven_days = now - 7 * 86400
@@ -192,9 +196,9 @@ def receipt_coverage(db, now=None):
     _checkpoint_schema(db)
     latest = _latest_receipts(db)
     windows = {
-        'all_time': {'total': 0, 'covered': 0, 'missing': 0},
-        'last_7d': {'total': 0, 'covered': 0, 'missing': 0},
-        'last_30d': {'total': 0, 'covered': 0, 'missing': 0},
+        'all_time': {'total': 0, 'covered': 0, 'missing': 0, 'receipt_before_last_prompt': 0},
+        'last_7d': {'total': 0, 'covered': 0, 'missing': 0, 'receipt_before_last_prompt': 0},
+        'last_30d': {'total': 0, 'covered': 0, 'missing': 0, 'receipt_before_last_prompt': 0},
     }
     for row in db.execute('SELECT harness,session,at,turn_at,project,project_id,prompt_at FROM receipt_checkpoints'):
         if not row[2] or row[2] < row[3]:
@@ -204,12 +208,15 @@ def receipt_coverage(db, now=None):
             continue
         chk_at = row[2]
         threshold = row[6] or row[3] or row[2]
-        matched = latest.get((row[0], row[1]), float('-inf')) >= threshold
+        receipt_at = latest.get((row[0], row[1]), float('-inf'))
+        matched = receipt_at >= threshold
         for w_name, w_active in (('all_time', True), ('last_30d', chk_at >= thirty_days), ('last_7d', chk_at >= seven_days)):
             if w_active:
                 windows[w_name]['total'] += 1
                 if matched:
                     windows[w_name]['covered'] += 1
+                    if receipt_at < row[3]:
+                        windows[w_name]['receipt_before_last_prompt'] += 1
                 else:
                     windows[w_name]['missing'] += 1
 
@@ -218,17 +225,20 @@ def receipt_coverage(db, now=None):
         'covered': windows['all_time']['covered'],
         'total': windows['all_time']['total'],
         'missing': windows['all_time']['missing'],
+        'receipt_before_last_prompt': windows['all_time']['receipt_before_last_prompt'],
         'last_7d': {
             'ratio': round(windows['last_7d']['covered'] / windows['last_7d']['total'], 3) if windows['last_7d']['total'] else None,
             'covered': windows['last_7d']['covered'],
             'total': windows['last_7d']['total'],
             'missing': windows['last_7d']['missing'],
+            'receipt_before_last_prompt': windows['last_7d']['receipt_before_last_prompt'],
         },
         'last_30d': {
             'ratio': round(windows['last_30d']['covered'] / windows['last_30d']['total'], 3) if windows['last_30d']['total'] else None,
             'covered': windows['last_30d']['covered'],
             'total': windows['last_30d']['total'],
             'missing': windows['last_30d']['missing'],
+            'receipt_before_last_prompt': windows['last_30d']['receipt_before_last_prompt'],
         }
     }
 
@@ -244,7 +254,7 @@ def refresh_gaps(engine, db):
         threshold = row[6] or row[3] or row[2]
         matched = latest.get((row[0], row[1]), float('-inf')) >= threshold
         if not matched:
-            gaps.append({'harness': row[0], 'session': row[1], 'checkpoint_at': row[2], 'turn_at': row[3], 'scope': 'session_only' if row[0] == 'antigravity' else 'turn' if row[3] else 'terminal_only'})
+            gaps.append({'harness': row[0], 'session': row[1], 'checkpoint_at': row[2], 'turn_at': row[3], 'scope': 'session_only' if row[0] == 'antigravity' else 'session' if row[6] else 'turn' if row[3] else 'terminal_only'})
             if row[4] and row[5]:
                 gaps[-1].update(project=row[4], project_id=row[5])
     coverage = receipt_coverage(db, now=time.time())
@@ -253,7 +263,7 @@ def refresh_gaps(engine, db):
         'receipt_coverage': coverage,
         'checkpoints': gaps,
         'scope_limits': {'antigravity': 'session_only; later per-turn boundaries unsupported', 'missing_prompt_event': 'terminal_only; receipt attribution may be incomplete'},
-        'meaning': 'Checkpoint without a matching structured receipt; may be trivial or deliberately omitted. No summary inferred.'
+        'meaning': 'Session without a matching receipt since its first known prompt; may be trivial or deliberately omitted. Coverage does not prove later edits were recorded. No summary inferred.'
     }))
 
 

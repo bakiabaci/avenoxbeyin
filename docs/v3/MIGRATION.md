@@ -157,8 +157,10 @@ internal/public context. Migration is not permission to expose Companion data.
 After Stop/SessionEnd, `doctor` reports potential receipt gaps when a checkpoint
 has no matching session receipt. This is a signal: a turn may be trivial or the
 user may have deliberately omitted memory. No transcript is promoted and no
-summary is generated to fill the gap. Matching uses the latest observed UserPromptSubmit or SessionStart boundary;
-a receipt from a previous turn cannot cover a later turn. Antigravity only
+summary is generated to fill the gap. Prompted sessions match receipts against
+their first known user prompt, not the latest conversational turn. Coverage
+measures session receipt presence, not whether every later edit was recorded.
+Antigravity only
 provides the initial invocation boundary in this adapter, so its result is
 explicitly session-limited rather than proof of per-turn completeness. Missing
 prompt events are reported as a terminal-only limitation. Explicit `no_memory`
@@ -175,6 +177,18 @@ every finished checkpoint. Checkpoints recorded before this field existed have
 no prompt marker, so the ratio starts with sessions after the upgrade and stays
 `null` until one is observed. A receipt whose `created_at` cannot be read never
 covers a session.
+
+`receipt_before_last_prompt` counts covered sessions whose latest receipt is
+older than the latest observed turn boundary (`turn_at`). It is informational,
+not an additional missing count, and appears in the overall, last-7-day and
+last-30-day coverage objects. `prompt_at` retains the earliest known user prompt,
+including older events delivered late; `turn_at` still retains the latest
+boundary. Legacy stores may have retained only their last prompt, so historical
+coverage cannot be fully repaired without earlier events. For coverage and gap
+matching, naive receipt dates are interpreted as UTC, consistently with receipt
+views; this does not change the separate knowledge-freshness calculation.
+When no user prompt
+was observed, gap matching retains the start/terminal fallback.
 
 ## Validation boundary
 
