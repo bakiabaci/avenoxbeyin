@@ -110,6 +110,13 @@ def state_location(vault: Path, state: Path, windows=None) -> dict:
         report["pin_status"] = "present" if pinned else "unreadable"
     if pinned is None:
         return report
+    if not Path(pinned).expanduser().is_absolute():
+        report["warnings"].append(
+            "pinned_state_not_absolute: the pinned state root is not an absolute path on this "
+            "machine. The installer pins an absolute path, so this one was written by another OS "
+            "through a synced vault or edited by hand (#249); the installed beyin.py reads this "
+            "machine's default state instead. Installation files are per machine and stay out of "
+            "the sync; see docs/v3/MULTI-MACHINE.md.")
     try:
         resolved = Path(pinned).expanduser().resolve()
     except (OSError, ValueError, RuntimeError):
@@ -194,10 +201,19 @@ def load_engine():
     return module
 
 
-def load_sync():
+def _ensure_scripts_path():
+    """Put the runtime scripts directory first on sys.path without importing the sync engine.
+    Helpers that only need sibling modules (skills, preferences, the advisor client, compaction)
+    call this instead of load_sync(); the directory must stay first so `beyin_v3` resolves to the
+    runtime, never to this CLI file."""
     adjacent = Path(__file__).resolve().parent
-    directory = adjacent if (adjacent / "beyin_v3_sync.py").exists() else Path(__file__).resolve().parents[1] / "template/.claude/scripts"
-    sys.path.insert(0, str(directory))
+    directory = str(adjacent if (adjacent / "beyin_v3_sync.py").exists() else Path(__file__).resolve().parents[1] / "template/.claude/scripts")
+    if sys.path[:1] != [directory]:
+        sys.path.insert(0, directory)
+
+
+def load_sync():
+    _ensure_scripts_path()
     from beyin_v3_sync import SyncEngine
     return SyncEngine
 
@@ -223,7 +239,7 @@ ERROR_HINTS = {
 
 
 def jev_client():
-    load_sync()
+    _ensure_scripts_path()
     import beyin_v3_jev_client as client
     return client
 
@@ -340,7 +356,7 @@ def read_json(filename: str):
 
 
 def load_skills():
-    load_sync()
+    _ensure_scripts_path()
     import beyin_v3_skills
     return beyin_v3_skills
 
@@ -382,6 +398,13 @@ def parser():
                           help="Opt-in SessionStart question for a long-quiet top-level folder")
     settings.add_argument("--promotion", choices=("on", "off"),
                           help="Opt-in touch log for the doctor's hot/cold folder report")
+    settings.add_argument("--inbox-report", choices=("on", "off"),
+                          help="Opt-in doctor report of notes waiting in top-level inbox folders")
+    settings.add_argument("--inbox-max-items", type=int, help="Inbox report threshold in notes (1..100000, default 10)")
+    settings.add_argument("--inbox-max-days", type=int, help="Inbox report threshold in days (1..3650, default 7)")
+    settings.add_argument("--inbox-folder", action="append",
+                          help="Top-level inbox folder name for the report (repeat for several; replaces the "
+                               "generic name detection; an empty value returns to it)")
     settings.add_argument("--parallel-sessions", choices=("on", "off"),
                           help="Opt-in one-line notice when another session is open on this vault")
     compact = sub.add_parser("companion-compact", help="Move older Last-Session/Threads entries verbatim into a private archive; deletes nothing")
@@ -438,7 +461,7 @@ def parser():
     return root
 
 
-def main(argv=None):
+def main(argv=None, return_result=False):
     if hasattr(sys.stdin, "reconfigure"):
         sys.stdin.reconfigure(encoding="utf-8")
     argument_parser = parser()
@@ -481,7 +504,7 @@ def main(argv=None):
             result = {"initialized": True, "state": str(state), "network": False,
                       "hooks_installed": False, "optional_provider": None}
         elif args.command == "preferences":
-            load_sync()
+            _ensure_scripts_path()
             import beyin_v3_preferences as preferences
             import beyin_v3_companion as companion
             limits = {name: value for name, value in (('Last-Session.md', args.last_session_chars),
@@ -491,6 +514,16 @@ def main(argv=None):
                                if getattr(args, key) is not None}
             if args.max_words is not None:
                 hygiene_changes['max_words'] = args.max_words
+            inbox_changes = {key: value for key, value in (
+                ('enabled', None if args.inbox_report is None else args.inbox_report == 'on'),
+                ('max_items', args.inbox_max_items), ('max_days', args.inbox_max_days),
+                ('folders', None if args.inbox_folder is None else [name for name in args.inbox_folder if name]))
+                if value is not None}
+            if inbox_changes:  # validated before anything is saved
+                current_inbox, inbox_valid = hygiene.read_inbox_settings(state)
+                if not inbox_valid:
+                    raise ValueError('inbox-report.json in the runtime state is invalid; fix or remove it first')
+                hygiene.check_inbox_settings(dict(current_inbox, **inbox_changes))
             if hygiene_changes:  # validated before anything is saved, like the companion limits
                 current_hygiene, hygiene_valid = hygiene.read_settings(state)
                 if not hygiene_valid:
@@ -568,6 +601,13 @@ def main(argv=None):
                 result['hygiene'], hygiene_valid = hygiene.read_settings(state)
                 if not hygiene_valid:
                     result['hygiene_notice'] = 'hygiene.json gecersiz; tum hijyen sinyalleri kapali sayiliyor.'
+            if inbox_changes:
+                result['inbox_report'] = hygiene.save_inbox_settings(state, inbox_changes)
+                result['status'] = 'saved'
+            else:
+                result['inbox_report'], inbox_valid = hygiene.read_inbox_settings(state)
+                if not inbox_valid:
+                    result['inbox_report_notice'] = 'inbox-report.json gecersiz; gelen kutusu raporu kapali sayiliyor.'
             # Machine-local (#170): an older release would reject a new .beyin-preferences.json key.
             import beyin_v3_parallel as parallel
             if args.parallel_sessions is not None:
@@ -676,10 +716,14 @@ def main(argv=None):
                     'error': (type(exc).__name__ + ': ' + str(exc))[:240],
                 }
             # A rejection on a plain note leaves the claim in current context; sync stays healthy.
+            # Notes that link to a rejected inference are listed for review only and never raise
+            # the doctor status: citing a rejected claim can be legitimate (explaining why it fell).
             try:
                 result['validity'] = load_sync().reader(store).validity_health()
             except Exception as exc:
                 result['validity'] = {'ignored_rejection_count': 0, 'ignored_rejections': [], 'truncated': False,
+                                      'rejected_dependent_count': 0, 'rejected_dependents': [],
+                                      'ambiguous_rejected_link_count': 0, 'ambiguous_rejected_links': [],
                                       'error': (type(exc).__name__ + ': ' + str(exc))[:240]}
             # Information only: a supersedes link that retires nothing keeps the old note in
             # context, as before #206; it never raises the doctor status.
@@ -687,10 +731,15 @@ def main(argv=None):
                 result['supersedes'] = load_sync().reader(store).supersedes_health()
             except Exception as exc:
                 result['supersedes'] = {'status': 'unavailable', 'error': type(exc).__name__}
+            # Information only: a note's own review_at date has come; never raises the doctor status.
+            try:
+                result['review'] = load_sync().reader(store).review_health()
+            except Exception as exc:
+                result['review'] = {'status': 'unavailable', 'error': type(exc).__name__}
             # Read-only information: each scan fails alone and never hides the rest of doctor.
             # The word cap and promotion reports follow the user's opt-in (state/hygiene.json):
             # a default install gets no new doctor lines and no whole-vault read.
-            for key in ('boundary', 'closed_tasks', 'word_cap', 'promotion'):
+            for key in ('boundary', 'closed_tasks', 'word_cap', 'promotion', 'inbox'):
                 try:
                     import beyin_v3_hygiene as hygiene
                     opted, _ = hygiene.read_settings(state)
@@ -699,6 +748,11 @@ def main(argv=None):
                                        if opted['word_cap_warning'] else {'enabled': False})
                     elif key == 'promotion':
                         result[key] = hygiene.promotion(vault, state) if opted['promotion'] else {'enabled': False}
+                    elif key == 'inbox':
+                        inbox, _ = hygiene.read_inbox_settings(state)
+                        result[key] = (hygiene.inbox_report(vault, state, inbox['max_items'], inbox['max_days'],
+                                                            folders=inbox['folders'])
+                                       if inbox['enabled'] else {'enabled': False})
                     else:
                         result[key] = getattr(hygiene, key)(vault)
                 except Exception as exc:
@@ -743,7 +797,7 @@ def main(argv=None):
         elif args.command == "skill-import":
             result = load_skills().import_skill(vault, state, args.source, name=args.name)
         elif args.command == "companion-compact":
-            load_sync()
+            _ensure_scripts_path()
             import beyin_v3_compact
             result = beyin_v3_compact.compact(vault, state, dry_run=args.dry_run)
             if any(entry['status'] == 'compacted' for entry in result['files'].values()):
@@ -850,6 +904,8 @@ def main(argv=None):
         else:
             payload = read_json(args.file)
             result = sync.update_task(payload["id"], payload["expected_revision"], payload["changes"])
+        if return_result:
+            return result, 0
         print(json.dumps(result, ensure_ascii=True, indent=2))
         return 0
     except Exception as exc:
@@ -857,6 +913,8 @@ def main(argv=None):
         error = {"error": type(exc).__name__, "message": str(exc)}
         if isinstance(exc, ValueError) and str(exc) in ERROR_HINTS:
             error["hint"] = ERROR_HINTS[str(exc)]
+        if return_result:
+            return error, 1
         print(json.dumps(error, ensure_ascii=True), file=sys.stderr)
         return 1
 

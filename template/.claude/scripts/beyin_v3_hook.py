@@ -426,6 +426,13 @@ def main():
             from beyin_v3_releases import session_start
             notice = session_start(vault, state)
         settings = read(vault)
+        if event == 'SessionStart' and not args.metadata_only and (state / 'yakala.json').is_file():
+            # Opt-in capture queue (beyin.py yakala kur): one directory listing, never a model call.
+            try:
+                from beyin_v3_yakala import session_notice
+                notice += session_notice(vault)
+            except Exception:
+                pass
         if not args.metadata_only and event in ('SessionStart', 'PostToolUse') and (state / 'hygiene.json').is_file():
             # Opt-in hygiene signals (#130), machine-local in state/hygiene.json. Independent of the
             # performance profile, and never able to cost the session or the turn itself.
@@ -495,8 +502,11 @@ def main():
                 return
             if process is not None and process.returncode:
                 raise RuntimeError("Source sync failed; metadata remains queued")
-            from beyin_v3_sync import SyncEngine
-            store = SyncEngine(vault, state).store
+            # Context only reads the store. SyncEngine adds the Markdown journal and the
+            # markdown_sources table, which the sync worker creates and every reader tolerates
+            # missing, so the foreground skips importing the sync engine.
+            from beyin_v3 import MemoryStore
+            store = MemoryStore(state, vault)
             query = prompt_text(payload)
             project = payload.get('project')
             project = project if isinstance(project, str) and project.strip() else None
