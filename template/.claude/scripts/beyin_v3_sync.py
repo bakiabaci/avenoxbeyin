@@ -16,7 +16,8 @@ _MODULE_DIR = str(Path(__file__).resolve().parent)
 if _MODULE_DIR not in sys.path:
     sys.path.insert(0, _MODULE_DIR)
 
-from beyin_v3 import HARNESSES, MemoryStore, ReceiptConflict, RevisionConflict, _json
+from beyin_v3 import (HARNESSES, REJECTED_AT, RETIRED_STATUSES, MemoryStore, ReceiptConflict, RevisionConflict, _json,
+                      _path_redirected, _rejected_inference, _status_word, rejected_dependents, resolve_supersedes)
 from beyin_v3_projections import project_receipts
 from beyin_v3_preferences import read as read_preferences
 from beyin_v3_secrets import redact as redact_secrets, record as record_redactions
@@ -135,6 +136,7 @@ def _parse_yaml_value(value):
 # silently ignored (only top-level metadata reaches the gates), so such a source
 # stays excluded with a warning, as before nested mappings were read (#179).
 GATE_KEYS = ('visibility', 'trust', 'trusted', 'remote_allowed')
+COMMA_LIST_KEYS = ('tags', 'aliases')
 
 
 def _mapping_value(sub_key, value):
@@ -219,7 +221,15 @@ def parse(text):
             else:
                 metadata[key] = None
             continue
-        metadata[key] = _parse_yaml_value(value)
+        parsed = _parse_yaml_value(value)
+        # Obsidian reads an unquoted `tags: a, b` or `aliases: a, b` as a list. Other keys keep
+        # their text: `title: Merhaba, dunya` or `project: Acme, Inc` stay one string, and a
+        # task update renders the parsed metadata back into the note.
+        if key in COMMA_LIST_KEYS and isinstance(parsed, str) and value[:1] not in '"\'' and ',' in parsed:
+            items = [part.strip() for part in parsed.split(',') if part.strip()]
+            if len(items) > 1:
+                parsed = items
+        metadata[key] = parsed
     return metadata, body
 
 
@@ -230,6 +240,43 @@ def render(metadata, body):
 EXCLUDED_FILES = {'agents.md', 'claude.md', 'gemini.md', 'skill.md', 'hooks.md', 'config.md', 'settings.md', 'instructions.md', 'codex.md', 'setup.md', 'install.md'}
 EXCLUDED_DIRS = {'node_modules', 'receipts', '__pycache__'}
 COMPLETION_FIELDS = {'completion_contract', 'completion_criterion', 'evidence_refs'}
+TASK_STATUSES = ('inbox', 'active', 'waiting', 'blocked', 'done', 'cancelled')
+
+
+def _check_task_dates(fields):
+    """Write-path check for due_at/updated_at given to task-create or task-update.
+
+    Sync does not apply it, so task files written before this check, or edited by
+    hand, stay indexed. The explicit grammar (the one rejected_at uses) keeps
+    acceptance the same on every Python version; a null due_at clears the date.
+    """
+    for field in ('due_at', 'updated_at'):
+        if field not in fields or (field == 'due_at' and fields[field] is None):
+            continue
+        value = fields[field]
+        try:
+            if not isinstance(value, str) or not REJECTED_AT.fullmatch(value):
+                raise ValueError(field)
+            datetime.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError(field + ' must be an ISO date or timestamp') from exc
+
+
+def _has_conflict_markers(text):
+    """True when a merge left <<<<<<< / ======= / >>>>>>> in order (#205).
+
+    Code fences are not skipped: a real conflict inside a note's code block must not reach context,
+    and a quoted example costs only a visible warning.
+    """
+    stage = 0
+    for line in text.splitlines():
+        if stage == 0 and line.startswith('<<<<<<<'):
+            stage = 1
+        elif stage == 1 and line.rstrip() == '=======':
+            stage = 2
+        elif stage == 2 and line.startswith('>>>>>>>'):
+            return True
+    return False
 
 
 class SyncEngine:
@@ -334,6 +381,12 @@ class SyncEngine:
                 if isinstance(item, dict) and (item.get('source') == source or
                                                (record_id is not None and item.get('id') == record_id))]
 
+    @staticmethod
+    def _write_blockers(result, source):
+        # Another receipt's divergence leaves this write's projection intact; it stays in every sync report (#210).
+        return [item for item in result['conflicts']
+                if not (item.get('kind') == 'receipt_divergence' and item.get('source') != source)]
+
     def _path(self, relative, existing=False):
         if not isinstance(relative, str) or Path(relative).is_absolute() or '..' in Path(relative).parts:
             raise ValueError('relative source required')
@@ -348,6 +401,25 @@ class SyncEngine:
         if existing and not path.is_file():
             raise ValueError('source missing')
         return path
+
+    def _scan_path(self, relative):
+        """Prove a walk entry's realpath using the already resolved vault root."""
+        if not isinstance(relative, str) or Path(relative).is_absolute() or '..' in Path(relative).parts:
+            raise ValueError('relative source required')
+        path = self.root / relative
+        if not path.is_relative_to(self.root):
+            raise ValueError('source outside vault')
+        cursor, boundary = str(path), str(self.root.parent)
+        while cursor != boundary:
+            if _path_redirected(cursor):
+                # Preserve the original outside-vault vs symlink rejection reason.
+                checked = self._path(relative, existing=True)
+                return checked, checked.resolve()
+            cursor = os.path.dirname(cursor)
+        # Without symlinks or traversal, joining a resolved root is its realpath.
+        if not path.is_file():
+            raise ValueError('source missing')
+        return path, path
 
     @staticmethod
     def _source_identity(path):
@@ -420,13 +492,69 @@ class SyncEngine:
                 'truncated': len(strict_issues) > 20 or len(legacy_done) > 20}
 
     def validity_health(self):
-        """Report `validity: rejected` that has no effect because the record is not an inference or preference."""
+        """Report `validity: rejected` that has no effect because the record is not an inference or preference,
+        and, for review only, current notes that link to a rejected inference or preference."""
         with self.store._connect() as db:
             records = [json.loads(row[0]) for row in db.execute('SELECT payload FROM records ORDER BY id')]
         ignored = [{'id': record.get('id'), 'source': record.get('source'), 'kind': record.get('kind')}
                    for record in records
                    if record.get('validity') == 'rejected' and record.get('kind') not in ('inference', 'preference')]
-        return {'ignored_rejection_count': len(ignored), 'ignored_rejections': ignored[:20], 'truncated': len(ignored) > 20}
+        dependents, ambiguous = rejected_dependents(records)
+        return {'ignored_rejection_count': len(ignored), 'ignored_rejections': ignored[:20],
+                'rejected_dependent_count': len(dependents), 'rejected_dependents': dependents[:20],
+                'ambiguous_rejected_link_count': len(ambiguous), 'ambiguous_rejected_links': ambiguous[:20],
+                'truncated': len(ignored) > 20 or len(dependents) > 20 or len(ambiguous) > 20}
+
+    def review_health(self, today=None):
+        """Notes whose own `review_at` date has come: an idea to revisit, not a task to do.
+
+        Only notes that set `review_at` are decoded (the payload is prefiltered in SQLite, so a
+        vault without the field pays no whole-index read); a retired note (by status or by another
+        note's supersedes) or a rejected one is not listed. A date in the rejected_at/due_at grammar
+        (time and offset ignored) on or before today (local) is due, oldest first; any other value
+        is listed apart instead of being guessed. An empty property (`review_at:` left by Obsidian)
+        or a Templater placeholder is not a date yet and is skipped. Information only.
+        """
+        today = today or datetime.now().date()
+        with self.store._connect() as db:
+            # _json() writes compact keys, so every record that sets the field contains this text.
+            records = [json.loads(row[0]) for row in db.execute(
+                'SELECT payload FROM records WHERE instr(payload, ?) > 0 ORDER BY id', ('"review_at":',))]
+        candidates = []
+        for record in records:
+            value = record.get('review_at')
+            if ('review_at' not in record or value is None or (isinstance(value, str) and (
+                    not value.strip() or re.fullmatch(r'\{\{[^{}\n]*\}\}', value.strip()))) or
+                    _rejected_inference(record) or _status_word(record) in RETIRED_STATUSES):
+                continue
+            candidates.append(record)
+        superseded = self.store._superseded_ids() if candidates else set()
+        due, invalid = [], []
+        for record in candidates:
+            if record.get('id') in superseded:
+                continue
+            value = record['review_at']
+            try:
+                when = (datetime.strptime(value[:10], '%Y-%m-%d').date()
+                        if isinstance(value, str) and REJECTED_AT.fullmatch(value) else None)
+            except ValueError:
+                when = None
+            if when is None:
+                invalid.append({'id': record.get('id'), 'source': record.get('source'), 'review_at': value})
+            elif when <= today:
+                due.append({'id': record.get('id'), 'source': record.get('source'), 'review_at': when.isoformat(),
+                            'days_overdue': (today - when).days})
+        due.sort(key=lambda entry: (-entry['days_overdue'], entry['source'] or ''))
+        invalid.sort(key=lambda entry: entry['source'] or '')
+        return {'due_count': len(due), 'due': due[:20], 'invalid_count': len(invalid), 'invalid': invalid[:20],
+                'truncated': len(due) > 20 or len(invalid) > 20}
+
+    def supersedes_health(self):
+        """Report supersedes values that retire nothing: unresolved, ambiguous or the note itself."""
+        with self.store._connect() as db:
+            records = [json.loads(row[0]) for row in db.execute('SELECT payload FROM records ORDER BY id')]
+        dead = resolve_supersedes(records)[1]
+        return {'dead_count': len(dead), 'dead': dead[:20], 'truncated': len(dead) > 20}
 
     def _scan(self):
         records, warnings, conflicts = {}, [], []
@@ -439,9 +567,12 @@ class SyncEngine:
                 path = Path(directory) / name
                 relative = path.relative_to(self.root).as_posix()
                 try:
-                    self._path(relative, existing=True)
+                    path, resolved = self._scan_path(relative)
                     raw = path.read_bytes()
-                    metadata, body = parse(raw.decode('utf-8'))
+                    text = raw.decode('utf-8')
+                    if _has_conflict_markers(text):
+                        raise ValueError('unresolved git conflict markers; resolve the merge before sync')
+                    metadata, body = parse(text)
                     if metadata.get('kind') == 'task' and body.lstrip().startswith('---'):
                         raise ValueError('task has embedded frontmatter; reconcile metadata and body explicitly')
                     if metadata.get('kind') == 'receipt' or metadata.get('generated') is True:
@@ -449,7 +580,7 @@ class SyncEngine:
                     record = dict(metadata, source=relative, text=body)
                     record.setdefault('id', 'md-' + _hash(relative)[:24])
                     record.setdefault('kind', 'note')
-                    record = self.store._validate(record)
+                    record = self.store._validate(record, _resolved_source=resolved)
                     if record['source_sha256'] != _hash(raw):
                         raise ValueError('source changed while scanning')
                     if record['id'] in records:
@@ -494,7 +625,10 @@ class SyncEngine:
         """Rebuild a receipts row from its immutable source; ValueError when the file is not a valid receipt."""
         path = self._path(relative, existing=True)
         # Bytes, not read_text: universal newlines would turn '\r' into '\n' and fake an event id collision.
-        metadata, body = parse(path.read_bytes().decode('utf-8'))
+        text = path.read_bytes().decode('utf-8')
+        if _has_conflict_markers(text):
+            raise ValueError('unresolved git conflict markers; resolve the merge before sync')
+        metadata, body = parse(text)
         event_id, harness, refs = metadata.get('event_id'), metadata.get('harness', 'manual'), metadata.get('refs')
         if metadata.get('kind') != 'receipt' or not isinstance(event_id, str) or not event_id.strip():
             raise ValueError('missing kind receipt or event_id')
@@ -527,25 +661,33 @@ class SyncEngine:
         try:
             receipts_dir = self._path('receipts')
             if not receipts_dir.is_dir():
-                return []
+                return [], []
             # Every new source, local or synced from another device, is a new directory entry and
             # changes this signature; a fresh state has none stored. Warm syncs stop at one stat.
             stat = receipts_dir.stat()
             signature = f'{stat.st_dev}:{stat.st_ino}:{stat.st_mtime_ns}'
             if db.execute("SELECT 1 FROM metadata WHERE key='receipt_scan_signature' AND value=?", (signature,)).fetchone():
-                return []
+                return [], []
             names = sorted(os.listdir(receipts_dir))
         except (ValueError, OSError) as exc:
-            return [{'source': 'receipts', 'reason': str(exc)}]
-        warnings = []
-        known = {_hash(row[0]) + '.md' for row in db.execute('SELECT id FROM receipts')}
+            return [{'source': 'receipts', 'reason': str(exc)}], []
+        warnings, conflicts = [], []
+        known = {_hash(row[0]) + '.md': json.loads(row[1]) for row in db.execute('SELECT id, payload FROM receipts')}
         for name in names:
-            # Indexed receipts stay authoritative; other names were never written by receipt().
-            if name in known or not re.fullmatch(r'[0-9a-f]{64}\.md', name):
+            # Other names were never written by receipt().
+            if not re.fullmatch(r'[0-9a-f]{64}\.md', name):
                 continue
             rel = 'receipts/' + name
             try:
                 event = self._receipt_event(rel)
+                if name in known:
+                    # Indexed receipts stay authoritative, but a source that no longer matches them means
+                    # another device wrote the same event_id and a merge kept its file (#205).
+                    old = known[name]
+                    if (old['summary'], old['refs']) != (event['summary'], event['refs']):
+                        conflicts.append({'source': rel, 'kind': 'receipt_divergence',
+                                          'reason': 'receipt source differs from indexed receipt; event_id reused on another device'})
+                    continue
                 db.execute('INSERT OR IGNORE INTO receipts VALUES (?,?)', (event['event_id'], _json(event)))
             except (ValueError, OSError, UnicodeError) as exc:
                 warnings.append({'source': rel, 'reason': str(exc)})
@@ -553,52 +695,63 @@ class SyncEngine:
         # (up to 2 s on FAT, 1 s on HFS+) could still hide behind an unchanged mtime.
         if not warnings and time.time_ns() - stat.st_mtime_ns > 2_000_000_000:
             db.execute("INSERT OR REPLACE INTO metadata VALUES ('receipt_scan_signature',?)", (signature,))
-        return warnings
+        return warnings, conflicts
 
     def sync(self):
         # Serialize recovery, source scan and projection across local processes.
         with self.store._connect() as db:
             db.execute('BEGIN IMMEDIATE')
             completed, recovery_conflicts = self._recover(db)
-            receipt_warnings = self._scan_receipts(db)
+            receipt_warnings, receipt_conflicts = self._scan_receipts(db)
             records, warnings, conflicts = self._scan()
             warnings.extend(receipt_warnings)
-            conflicts.extend(recovery_conflicts)
-            old_owned = {row[0] for row in db.execute('SELECT id FROM markdown_sources')}
+            conflicts.extend(recovery_conflicts + receipt_conflicts)
+            old_sources = dict(db.execute('SELECT id, source FROM markdown_sources ORDER BY id'))
+            # Match the old covering-ID scan's set construction and deletion event order.
+            old_owned = {id for id in old_sources}
+            old_payloads = dict(db.execute('SELECT id, payload FROM records'))
             deleted = 0
             for id in old_owned - records.keys():
-                row = db.execute('SELECT payload FROM records WHERE id=?', (id,)).fetchone()
-                if row:
-                    old = json.loads(row[0])
-                    db.execute("INSERT INTO events(event_type,record_id,revision,record) VALUES ('delete',?,?,?)", (id, old['revision'], row[0]))
+                previous_payload = old_payloads.get(id)
+                if previous_payload is not None:
+                    old = json.loads(previous_payload)
+                    db.execute("INSERT INTO events(event_type,record_id,revision,record) VALUES ('delete',?,?,?)", (id, old['revision'], previous_payload))
                     db.execute('DELETE FROM records WHERE id=?', (id,))
                     deleted += 1
                 db.execute('DELETE FROM markdown_sources WHERE id=?', (id,))
             for id, record in records.items():
-                row = db.execute('SELECT payload FROM records WHERE id=?', (id,)).fetchone()
-                if row and id in old_owned:
-                    previous = json.loads(row[0])
+                previous_payload = old_payloads.get(id)
+                if previous_payload is not None and id in old_owned:
+                    previous = json.loads(previous_payload)
                     if previous['source_sha256'] != record['source_sha256']:
                         record['revision'] = max(record['revision'], previous['revision'] + 1)
                     else:
                         record['revision'] = max(record['revision'], previous['revision'])
                 payload = _json(record)
-                if row and id not in old_owned and row[0] != payload:
+                if previous_payload is not None and id not in old_owned and previous_payload != payload:
                     conflicts.append({'id': id, 'reason': 'id already owned by another record'})
                     continue
-                if not row or row[0] != payload:
-                    event_type = 'update' if row else 'ingest'
+                if previous_payload != payload:
+                    event_type = 'update' if previous_payload is not None else 'ingest'
                     db.execute('INSERT OR REPLACE INTO records VALUES (?,?)', (id, payload))
                     db.execute('INSERT INTO events(event_type,record_id,revision,record) VALUES (?,?,?,?)', (event_type, id, record['revision'], payload))
-                db.execute('INSERT OR REPLACE INTO markdown_sources VALUES (?,?)', (id, record['source']))
+                if old_sources.get(id) != record['source']:
+                    db.execute('INSERT OR REPLACE INTO markdown_sources VALUES (?,?)', (id, record['source']))
             conflicts.extend(project_receipts(self, db, warnings))
+            # A supersedes value that retires nothing is reported, not a degraded scan: no
+            # source was excluded and the hook must not warn on every turn about it.
+            dead_supersedes = resolve_supersedes([json.loads(row[0]) for row in db.execute('SELECT payload FROM records ORDER BY id')])[1]
             if conflicts:
                 # A receipt hidden by a directory mtime that did not move surfaces as a view
                 # conflict; the next sync then rescans receipts/ in full.
                 db.execute("DELETE FROM metadata WHERE key='receipt_scan_signature'")
         for entry in completed:
             entry.unlink(missing_ok=True)
-        return {'status': 'conflict' if conflicts else 'degraded' if warnings else 'succeeded', 'indexed': len(records), 'deleted': deleted, 'warnings': warnings, 'conflicts': conflicts}
+        result = {'status': 'conflict' if conflicts else 'degraded' if warnings else 'succeeded', 'indexed': len(records), 'deleted': deleted, 'warnings': warnings, 'conflicts': conflicts}
+        if dead_supersedes:
+            result['supersedes_issues'] = dead_supersedes[:20]
+            result['supersedes_issue_count'] = len(dead_supersedes)
+        return result
 
     def _intent(self, relative, old_hash, content, kind, event=None):
         path = self._path(relative)
@@ -619,6 +772,9 @@ class SyncEngine:
         allowed = {'title', 'status', 'project', 'visibility', 'facts', 'next_action', 'owner', 'priority', 'due_at', 'updated_at', 'supersedes', 'completion_contract', 'completion_criterion', 'evidence_refs'}
         if not isinstance(changes, dict) or set(changes) - allowed:
             raise ValueError('unsupported task metadata changes')
+        if 'status' in changes and changes['status'] not in TASK_STATUSES:
+            raise ValueError('valid explicit task status required')
+        _check_task_dates(changes)
         changes, redacted = self._protect_metadata(changes)
         with self.store._connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -662,7 +818,7 @@ class SyncEngine:
             intended = render(metadata, body)
             self._intent(record['source'], record['source_sha256'], intended, 'task')
         result = self.sync()
-        if result['conflicts']:
+        if self._write_blockers(result, record['source']):
             raise RevisionConflict('source projection conflict')
         with self.store._connect() as db:
             row = db.execute('SELECT payload FROM records WHERE id=?', (id,)).fetchone()
@@ -750,8 +906,9 @@ class SyncEngine:
             raise ValueError('stable task id required')
         if not isinstance(metadata.get('owner'), str) or not metadata['owner'].strip():
             raise ValueError('explicit task owner required')
-        if metadata.get('status') not in ('inbox', 'active', 'waiting', 'blocked', 'done', 'cancelled'):
+        if metadata.get('status') not in TASK_STATUSES:
             raise ValueError('valid explicit task status required')
+        _check_task_dates(metadata)
         if type(metadata.get('revision', 1)) is not int or metadata.get('revision', 1) != 1:
             raise ValueError('new task revision must be 1')
         if metadata.get('kind', 'task') != 'task':
@@ -834,7 +991,7 @@ class SyncEngine:
             else:
                 self._intent(source, None, content, 'receipt', event)
         result = self.sync()
-        if result['conflicts']:
+        if self._write_blockers(result, source):
             raise ReceiptConflict('receipt projection conflict')
         if self._path(source, existing=True).read_bytes() != content.encode('utf-8'):
             raise ReceiptConflict('receipt source changed before readback')

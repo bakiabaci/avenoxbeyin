@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import time
 
@@ -109,6 +110,13 @@ def state_location(vault: Path, state: Path, windows=None) -> dict:
         report["pin_status"] = "present" if pinned else "unreadable"
     if pinned is None:
         return report
+    if not Path(pinned).expanduser().is_absolute():
+        report["warnings"].append(
+            "pinned_state_not_absolute: the pinned state root is not an absolute path on this "
+            "machine. The installer pins an absolute path, so this one was written by another OS "
+            "through a synced vault or edited by hand (#249); the installed beyin.py reads this "
+            "machine's default state instead. Installation files are per machine and stay out of "
+            "the sync; see docs/v3/MULTI-MACHINE.md.")
     try:
         resolved = Path(pinned).expanduser().resolve()
     except (OSError, ValueError, RuntimeError):
@@ -149,6 +157,38 @@ def state_location(vault: Path, state: Path, windows=None) -> dict:
     return report
 
 
+def receipt_line_endings(vault: Path) -> dict:
+    """Report whether git can rewrite receipt line endings in this vault (#205).
+
+    Receipts are compared byte for byte. With core.autocrlf=true (the Git for Windows
+    default) a pulled receipt is checked out as CRLF unless the vault stops that for
+    receipts/ with `-text` or `eol=lf`; the index then reads a different summary and the
+    same receipt resubmitted from the other machine fails as an event id collision.
+    Read-only, information only; a vault that is not a git work tree reports not_applicable.
+    """
+    def git(*args):
+        done = subprocess.run(("git", "-C", str(vault)) + args, capture_output=True, text=True, timeout=10)
+        return done.returncode, done.stdout.strip()
+    try:
+        code, inside = git("rev-parse", "--is-inside-work-tree")
+        if code != 0 or inside != "true":
+            return {"status": "not_applicable", "reason": "vault is not a git work tree"}
+        _, autocrlf = git("config", "--type=bool", "--get", "core.autocrlf")
+        if autocrlf != "true":
+            return {"status": "ok", "autocrlf": autocrlf or "unset"}
+        _, attrs = git("check-attr", "text", "eol", "--", "receipts/x.md")
+        found = dict((line.split(": ")[1], line.split(": ")[2]) for line in attrs.splitlines() if line.count(": ") == 2)
+        if found.get("text") == "unset" or found.get("eol") == "lf":
+            return {"status": "ok", "autocrlf": "true", "receipts_attributes": found}
+        return {"status": "warning", "autocrlf": "true", "receipts_attributes": found,
+                "warning": "line_endings: core.autocrlf=true and receipts/ is not pinned, so a receipt synced "
+                           "from another machine can be checked out as CRLF, which changes its bytes and makes "
+                           "the same receipt fail as an event id collision. Add 'receipts/** -text' to the "
+                           "vault's .gitattributes and check the receipts out again; see docs/v3/MULTI-MACHINE.md."}
+    except Exception as exc:  # no git, a hung git or a broken config must never hide the rest of doctor
+        return {"status": "unavailable", "error": type(exc).__name__}
+
+
 def load_engine():
     adjacent = Path(__file__).resolve().parent / "beyin_v3.py"
     path = adjacent if adjacent != Path(__file__).resolve() and adjacent.exists() else Path(__file__).resolve().parents[1] / "template/.claude/scripts/beyin_v3.py"
@@ -161,10 +201,19 @@ def load_engine():
     return module
 
 
-def load_sync():
+def _ensure_scripts_path():
+    """Put the runtime scripts directory first on sys.path without importing the sync engine.
+    Helpers that only need sibling modules (skills, preferences, the advisor client, compaction)
+    call this instead of load_sync(); the directory must stay first so `beyin_v3` resolves to the
+    runtime, never to this CLI file."""
     adjacent = Path(__file__).resolve().parent
-    directory = adjacent if (adjacent / "beyin_v3_sync.py").exists() else Path(__file__).resolve().parents[1] / "template/.claude/scripts"
-    sys.path.insert(0, str(directory))
+    directory = str(adjacent if (adjacent / "beyin_v3_sync.py").exists() else Path(__file__).resolve().parents[1] / "template/.claude/scripts")
+    if sys.path[:1] != [directory]:
+        sys.path.insert(0, directory)
+
+
+def load_sync():
+    _ensure_scripts_path()
     from beyin_v3_sync import SyncEngine
     return SyncEngine
 
@@ -190,7 +239,7 @@ ERROR_HINTS = {
 
 
 def jev_client():
-    load_sync()
+    _ensure_scripts_path()
     import beyin_v3_jev_client as client
     return client
 
@@ -214,6 +263,91 @@ def jev_advice(result):
     return result
 
 
+HOOK_FILES = (".claude/settings.local.json", ".codex/hooks.json", ".agents/hooks.json")
+
+
+def _hook_arguments(command: str) -> list:
+    """Arguments of one installed hook command: POSIX shell text or the Windows EncodedCommand."""
+    import base64
+    import re
+    import shlex
+    match = re.search(r"-EncodedCommand\s+([A-Za-z0-9+/=]+)", command, re.I)
+    if match:
+        try:
+            script = base64.b64decode(match.group(1), validate=True).decode("utf-16le")
+        except (ValueError, UnicodeError):
+            return []
+        return [item.replace("''", "'") for item in re.findall(r"'((?:[^']|'')*)'", script)]
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return []
+
+
+def hook_paths(vault: Path) -> dict:
+    """Read-only (#204): hook commands that still name another install location.
+
+    A vault moved to another account or machine together with its hook files keeps commands
+    such as C:\\Users\\<old>\\...\\beyin_v3_hook.py; every lifecycle hook then fails with a
+    generic error. Reads only the three hook files; never writes and never walks the vault."""
+    stale, checked = [], 0
+    try:
+        here = vault.resolve()
+    except OSError:
+        here = vault
+    for name in HOOK_FILES:
+        path = vault / name
+        if not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            stale.append({"file": name, "reason": "unreadable"})
+            continue
+        events = data.get("beyin-v3", {}) if name == ".agents/hooks.json" else data.get("hooks", {})
+        handlers = []
+        for event, groups in (events.items() if isinstance(events, dict) else ()):
+            for group in groups if isinstance(groups, list) else ():
+                if not isinstance(group, dict):
+                    continue
+                for handler in group.get("hooks", [group]) if "hooks" in group else [group]:
+                    if isinstance(handler, dict) and isinstance(handler.get("command"), str):
+                        handlers.append((event, handler["command"]))
+        for event, command in handlers:
+            arguments = _hook_arguments(command)
+            script = next((a for a in arguments if a.replace("\\", "/").endswith("/beyin_v3_hook.py")), None)
+            if script is None:
+                continue
+            checked += 1
+            reasons = []
+            if not Path(script).is_file():
+                reasons.append(("hook_script_missing", script))
+            if "--vault" in arguments[:-1]:
+                bound = arguments[arguments.index("--vault") + 1]
+                try:
+                    same = Path(bound).resolve() == here
+                except OSError:
+                    same = False
+                if not same:
+                    reasons.append(("other_vault", bound))
+            if arguments and Path(arguments[0]).is_absolute() and not Path(arguments[0]).exists():
+                reasons.append(("python_missing", arguments[0]))
+            for reason, value in reasons:
+                entry = {"file": name, "event": event, "reason": reason, "path": value}
+                if entry not in stale:
+                    stale.append(entry)
+    if not checked and not stale:
+        return {"status": "not_installed", "checked": 0}
+    result = {"status": "stale" if stale else "ok", "checked": checked}
+    if stale:
+        result["stale"] = stale[:20]
+        result["hint"] = ("Hook commands point to another install location (vault moved, or hook files synced "
+                          "from another machine). Run the installer again on this machine with this vault; if the "
+                          "vault moved from another account or folder, pass the old state folder (or a copy) with "
+                          "--state. Keep hook files out of sync (docs/v3/MULTI-MACHINE.md).")
+    return result
+
+
 def read_json(filename: str):
     if filename == "-":
         return json.load(sys.stdin)
@@ -222,7 +356,7 @@ def read_json(filename: str):
 
 
 def load_skills():
-    load_sync()
+    _ensure_scripts_path()
     import beyin_v3_skills
     return beyin_v3_skills
 
@@ -282,6 +416,13 @@ def parser():
                           help="Opt-in SessionStart question for a long-quiet top-level folder")
     settings.add_argument("--promotion", choices=("on", "off"),
                           help="Opt-in touch log for the doctor's hot/cold folder report")
+    settings.add_argument("--inbox-report", choices=("on", "off"),
+                          help="Opt-in doctor report of notes waiting in top-level inbox folders")
+    settings.add_argument("--inbox-max-items", type=int, help="Inbox report threshold in notes (1..100000, default 10)")
+    settings.add_argument("--inbox-max-days", type=int, help="Inbox report threshold in days (1..3650, default 7)")
+    settings.add_argument("--inbox-folder", action="append",
+                          help="Top-level inbox folder name for the report (repeat for several; replaces the "
+                               "generic name detection; an empty value returns to it)")
     settings.add_argument("--parallel-sessions", choices=("on", "off"),
                           help="Opt-in one-line notice when another session is open on this vault")
     compact = sub.add_parser("companion-compact", help="Move older Last-Session/Threads entries verbatim into a private archive; deletes nothing")
@@ -324,8 +465,13 @@ def parser():
     answer.add_argument("--file", required=True, help="JSON list of claims (maximum 32,000 characters)")
     answer.add_argument("--project", required=True)
     receipt = sub.add_parser("receipt", help="Submit an idempotent source-linked receipt")
-    receipt.add_argument("--file", default="-", help="JSON input path, or - for stdin")
+    receipt.add_argument("--file", help="JSON input path, or - for stdin (default without receipt flags)")
     receipt.add_argument("--harness", choices=("codex", "claude", "antigravity", "hermes", "opencode", "omp"), default="codex")
+    receipt.add_argument("--event-id", help="Required receipt event identifier in flag mode")
+    receipt.add_argument("--summary", help="Receipt summary text, preserving literal newlines")
+    receipt.add_argument("--summary-file", type=Path, metavar="PATH", help="Read the receipt summary from a UTF-8 file")
+    receipt.add_argument("--ref", action="append", help="Vault-relative source path; repeat for multiple refs")
+    receipt.add_argument("--session", help="Optional session identifier")
     update = sub.add_parser("task-update", help="Update task with expected revision")
     update.add_argument("--file", default="-", help="JSON {id, expected_revision, changes}")
     history = sub.add_parser("history", help="Read ordered revision snapshots for a record")
@@ -333,16 +479,27 @@ def parser():
     return root
 
 
-def main(argv=None):
+def main(argv=None, return_result=False):
     if hasattr(sys.stdin, "reconfigure"):
         sys.stdin.reconfigure(encoding="utf-8")
-    p = parser()
-    try:
-        args = p.parse_args(argv)
-    except SystemExit as exc:
-        if "--json" in (argv or []):
-            print('{"error": "ArgumentError", "message": "Invalid arguments provided."}')
-        raise
+    argument_parser = parser()
+    args = argument_parser.parse_args(argv)
+    receipt_flags = args.command == "receipt" and any(
+        getattr(args, name) is not None for name in ("event_id", "summary", "summary_file", "ref", "session"))
+    if receipt_flags:
+        for stream in (sys.stdout, sys.stderr):
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8")
+        if args.file is not None:
+            argument_parser.error("--file cannot be combined with receipt flags")
+        if args.event_id is None:
+            argument_parser.error("--event-id is required in flag mode")
+        if args.summary is not None and args.summary_file is not None:
+            argument_parser.error("use exactly one of --summary and --summary-file")
+        if args.summary is None and args.summary_file is None:
+            argument_parser.error("--summary or --summary-file is required in flag mode")
+        if not args.ref:
+            argument_parser.error("--ref is required in flag mode (at least one)")
     try:
         vault = args.vault.expanduser().resolve()
         if not vault.is_dir():
@@ -365,7 +522,7 @@ def main(argv=None):
             result = {"initialized": True, "state": str(state), "network": False,
                       "hooks_installed": False, "optional_provider": None}
         elif args.command == "preferences":
-            load_sync()
+            _ensure_scripts_path()
             import beyin_v3_preferences as preferences
             import beyin_v3_companion as companion
             limits = {name: value for name, value in (('Last-Session.md', args.last_session_chars),
@@ -375,6 +532,16 @@ def main(argv=None):
                                if getattr(args, key) is not None}
             if args.max_words is not None:
                 hygiene_changes['max_words'] = args.max_words
+            inbox_changes = {key: value for key, value in (
+                ('enabled', None if args.inbox_report is None else args.inbox_report == 'on'),
+                ('max_items', args.inbox_max_items), ('max_days', args.inbox_max_days),
+                ('folders', None if args.inbox_folder is None else [name for name in args.inbox_folder if name]))
+                if value is not None}
+            if inbox_changes:  # validated before anything is saved
+                current_inbox, inbox_valid = hygiene.read_inbox_settings(state)
+                if not inbox_valid:
+                    raise ValueError('inbox-report.json in the runtime state is invalid; fix or remove it first')
+                hygiene.check_inbox_settings(dict(current_inbox, **inbox_changes))
             if hygiene_changes:  # validated before anything is saved, like the companion limits
                 current_hygiene, hygiene_valid = hygiene.read_settings(state)
                 if not hygiene_valid:
@@ -452,6 +619,13 @@ def main(argv=None):
                 result['hygiene'], hygiene_valid = hygiene.read_settings(state)
                 if not hygiene_valid:
                     result['hygiene_notice'] = 'hygiene.json gecersiz; tum hijyen sinyalleri kapali sayiliyor.'
+            if inbox_changes:
+                result['inbox_report'] = hygiene.save_inbox_settings(state, inbox_changes)
+                result['status'] = 'saved'
+            else:
+                result['inbox_report'], inbox_valid = hygiene.read_inbox_settings(state)
+                if not inbox_valid:
+                    result['inbox_report_notice'] = 'inbox-report.json gecersiz; gelen kutusu raporu kapali sayiliyor.'
             # Machine-local (#170): an older release would reject a new .beyin-preferences.json key.
             import beyin_v3_parallel as parallel
             if args.parallel_sessions is not None:
@@ -489,6 +663,10 @@ def main(argv=None):
                     seen[event['harness']].add(event.get('event', 'unknown'))
             result['lifecycle'] = {name: {'status': 'observed_metadata' if events else 'never_seen', 'events': sorted(events)} for name, events in seen.items()}
             result['legacy_external_schedules'] = 'not_inspected; review custom OS/compiler schedules before migration'
+            try:  # information only: a stale-path report must never hide the rest of doctor
+                result['hook_paths'] = hook_paths(vault)
+            except Exception as exc:
+                result['hook_paths'] = {'status': 'unavailable', 'error': type(exc).__name__}
             # Information only; a split or container-bound state root never raises the status.
             try:
                 result['state_location'] = state_location(vault, state)
@@ -556,15 +734,30 @@ def main(argv=None):
                     'error': (type(exc).__name__ + ': ' + str(exc))[:240],
                 }
             # A rejection on a plain note leaves the claim in current context; sync stays healthy.
+            # Notes that link to a rejected inference are listed for review only and never raise
+            # the doctor status: citing a rejected claim can be legitimate (explaining why it fell).
             try:
                 result['validity'] = load_sync().reader(store).validity_health()
             except Exception as exc:
                 result['validity'] = {'ignored_rejection_count': 0, 'ignored_rejections': [], 'truncated': False,
+                                      'rejected_dependent_count': 0, 'rejected_dependents': [],
+                                      'ambiguous_rejected_link_count': 0, 'ambiguous_rejected_links': [],
                                       'error': (type(exc).__name__ + ': ' + str(exc))[:240]}
+            # Information only: a supersedes link that retires nothing keeps the old note in
+            # context, as before #206; it never raises the doctor status.
+            try:
+                result['supersedes'] = load_sync().reader(store).supersedes_health()
+            except Exception as exc:
+                result['supersedes'] = {'status': 'unavailable', 'error': type(exc).__name__}
+            # Information only: a note's own review_at date has come; never raises the doctor status.
+            try:
+                result['review'] = load_sync().reader(store).review_health()
+            except Exception as exc:
+                result['review'] = {'status': 'unavailable', 'error': type(exc).__name__}
             # Read-only information: each scan fails alone and never hides the rest of doctor.
             # The word cap and promotion reports follow the user's opt-in (state/hygiene.json):
             # a default install gets no new doctor lines and no whole-vault read.
-            for key in ('boundary', 'closed_tasks', 'word_cap', 'promotion'):
+            for key in ('boundary', 'closed_tasks', 'word_cap', 'promotion', 'inbox'):
                 try:
                     import beyin_v3_hygiene as hygiene
                     opted, _ = hygiene.read_settings(state)
@@ -573,6 +766,11 @@ def main(argv=None):
                                        if opted['word_cap_warning'] else {'enabled': False})
                     elif key == 'promotion':
                         result[key] = hygiene.promotion(vault, state) if opted['promotion'] else {'enabled': False}
+                    elif key == 'inbox':
+                        inbox, _ = hygiene.read_inbox_settings(state)
+                        result[key] = (hygiene.inbox_report(vault, state, inbox['max_items'], inbox['max_days'],
+                                                            folders=inbox['folders'])
+                                       if inbox['enabled'] else {'enabled': False})
                     else:
                         result[key] = getattr(hygiene, key)(vault)
                 except Exception as exc:
@@ -582,7 +780,8 @@ def main(argv=None):
                 result['parallel_sessions'] = parallel.doctor(state)
             except Exception as exc:
                 result['parallel_sessions'] = {'status': 'unavailable', 'error': type(exc).__name__}
-            result['status'] = ('needs_attention' if health.get('sync', {}).get('status') in ('conflict', 'degraded') or result['skill_conflicts'] or result.get('instruction_conflicts') or result['hook-error.json'] or result['task_completion']['strict_issue_count'] or result['task_completion'].get('error') or result['validity']['ignored_rejection_count'] or result['validity'].get('error') else 'pending' if result['pending_events'] else 'observed_metadata' if result['acknowledged_events'] else 'never_seen')
+            result['receipt_line_endings'] = receipt_line_endings(vault)  # information only: the status below is untouched
+            result['status'] = ('needs_attention' if health.get('sync', {}).get('status') in ('conflict', 'degraded') or result['hook_paths'].get('status') == 'stale' or result['skill_conflicts'] or result.get('instruction_conflicts') or result['hook-error.json'] or result['task_completion']['strict_issue_count'] or result['task_completion'].get('error') or result['validity']['ignored_rejection_count'] or result['validity'].get('error') else 'pending' if result['pending_events'] else 'observed_metadata' if result['acknowledged_events'] else 'never_seen')
             # Information only: a leftover global OMP hook copy predates the vault-owned plan
             # (OMP.md says the installer never updates or removes it). After an engine update the
             # copy can be older than the installed vault hook, so a session outside the vault can
@@ -616,7 +815,7 @@ def main(argv=None):
         elif args.command == "skill-import":
             result = load_skills().import_skill(vault, state, args.source, name=args.name)
         elif args.command == "companion-compact":
-            load_sync()
+            _ensure_scripts_path()
             import beyin_v3_compact
             result = beyin_v3_compact.compact(vault, state, dry_run=args.dry_run)
             if any(entry['status'] == 'compacted' for entry in result['files'].values()):
@@ -701,7 +900,18 @@ def main(argv=None):
                 handler = assess_memory
             result = handler(sync.store, json.loads(raw), project=args.project)
         elif args.command == "receipt":
-            payload = read_json(args.file)
+            if receipt_flags:
+                summary = args.summary
+                if args.summary_file is not None:
+                    # Preserve CRLF as well as LF, matching the JSON input text. utf-8-sig drops
+                    # the BOM that Windows PowerShell 5.1 writes with -Encoding UTF8.
+                    with args.summary_file.open(encoding="utf-8-sig", newline="") as stream:
+                        summary = stream.read()
+                payload = {"event_id": args.event_id, "summary": summary, "refs": args.ref}
+                if args.session is not None:
+                    payload["session"] = args.session
+            else:
+                payload = read_json(args.file if args.file is not None else "-")
             result = sync.receipt(payload["event_id"], payload["summary"],
                                           payload["refs"], args.harness, session=payload.get('session'))
         elif args.command == "history":
@@ -714,6 +924,8 @@ def main(argv=None):
         else:
             payload = read_json(args.file)
             result = sync.update_task(payload["id"], payload["expected_revision"], payload["changes"])
+        if return_result:
+            return result, 0
         print(json.dumps(result, ensure_ascii=True, indent=2))
         return 0
     except Exception as exc:
@@ -721,7 +933,9 @@ def main(argv=None):
         error = {"error": type(exc).__name__, "message": str(exc)}
         if isinstance(exc, ValueError) and str(exc) in ERROR_HINTS:
             error["hint"] = ERROR_HINTS[str(exc)]
-        print(json.dumps(error, ensure_ascii=False), file=sys.stderr)
+        if return_result:
+            return error, 1
+        print(json.dumps(error, ensure_ascii=True), file=sys.stderr)
         return 1
 
 

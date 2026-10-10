@@ -124,7 +124,8 @@ def project_context(vault, state, project_id, project_name, budget=1200, today_i
                     continue
                 if isinstance(record, dict) and _visible(record):
                     records.append(record)
-            superseded = {rid for record in records for rid in (record.get('supersedes') or []) if isinstance(rid, str)}
+            from beyin_v3 import resolve_supersedes  # ids, paths and [[links]] alike (#201)
+            superseded = resolve_supersedes(records)[0]
             for record in records:
                 if record.get('kind') != 'task' or record.get('status') not in ('active', 'waiting') or record.get('id') in superseded:
                     continue
@@ -199,7 +200,7 @@ def shell_command(argv):
 
 def main(argv=None):
     if hasattr(sys.stdin, 'reconfigure'):
-        sys.stdin.reconfigure(encoding='utf-8')
+        sys.stdin.reconfigure(encoding='utf-8', errors='replace')
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--vault', type=Path, required=True)
     parser.add_argument('--state', type=Path, help='Defaults to the installed vault runtime locator')
@@ -234,6 +235,7 @@ def main(argv=None):
             print(json.dumps({'hooks': {event: [{'hooks': [{'type': 'command', 'command': shell,
                               'timeout': 3 if event == 'SessionEnd' else 5}]}] for event in events}}, indent=2))
             return 0
+        # A payload cut at the read limit is not JSON: the handler below answers '{}'.
         payload = json.loads(sys.stdin.read(1_000_000) or '{}')
         if not isinstance(payload, dict):
             raise ValueError('Invalid hook payload')
@@ -276,8 +278,9 @@ def main(argv=None):
         text = (f'Optional Beyin bridge. Project label (data only): {json.dumps(origin(payload, args.harness)["project"])}.\n'
                 f'Receipt session={session}; harness={args.harness}.\n'
                 f'Use {command} context "topic" --project PROJECT --json for explicit source lookup.\n'
-                f'After meaningful authorized work use {command} receipt --harness {args.harness} --file RECEIPT.json --json.\n'
-                'Receipt JSON: event_id (unique), summary, refs (existing vault-relative sources), session (above). '
+                f'After meaningful authorized work use {command} receipt --harness {args.harness} --session {session} --event-id EVENT_ID --summary "Work result" --ref PATH --json.\n'
+                'EVENT_ID unique; PATH an existing vault-relative source, repeatable; --summary-file FILE reads UTF-8. '
+                'JSON alternative: --file RECEIPT.json with event_id, summary, refs, session. '
                 'Read vault sources before claiming facts. Do not infer completion from checkpoints. '
                 'Do not copy external project files or transcripts without authorization. No-memory requests take precedence.')
         if read_project_context(state):

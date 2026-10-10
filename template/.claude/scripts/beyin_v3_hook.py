@@ -16,13 +16,16 @@ EVENTS = {"SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "PreCompact
 HOOK_BUDGET = 3.8  # seconds; installed POSIX hooks are killed at 5
 RECEIPT_REMINDER = (
     "Files were edited in this session but no receipt was written after the edits. If the work is done, write one now: "
-    "python3 beyin.py receipt --file RECEIPT_JSON --harness {harness}. "
-    "Receipt session={session}; put this value in the JSON session field so the receipt closes this checkpoint. "
+    'python3 beyin.py receipt --harness {harness} --session {session} --event-id EVENT_ID --summary "Work result" --ref PATH. '
+    "Repeat --ref for multiple sources; use --summary-file PATH for a UTF-8 summary file. "
+    "JSON alternative: python3 beyin.py receipt --file RECEIPT_JSON --harness {harness}. "
+    "Receipt session={session}; use this value for --session or the JSON session field so the receipt closes this checkpoint. "
     "If the work produced a lasting learning, distill it under knowledge/concepts/ before the receipt and list that note in refs."
 )
 KNOWLEDGE_REMINDER = (
-    "Learnings were reported in the receipt but no note under knowledge/ was updated in this session. "
-    "Distill lasting learnings into knowledge/concepts/<name>.md (or update an existing concept, then sync); "
+    "Learnings were reported in the receipt but no note under knowledge/ or 🧠 500-Knowledge/ was updated "
+    "in this session. Distill lasting learnings into knowledge/concepts/<name>.md (or update an existing "
+    "concept, then sync); "
     "if no permanent note is required, state that in one sentence to proceed."
 )
 HARNESS_SYNTHETIC_PROMPT_PREFIXES = (
@@ -153,9 +156,11 @@ _LEARNING_LABEL = re.compile(
     r"^[\s>*#_\-\u2022]*(?:öğrenilen(?:ler)?|ogrenilen(?:ler)?|kalici\s+(?:öğrenim|ogrenim)(?:ler)?|"
     r"ders(?:ler)?|learned|lessons?(?:\s+learned)?|learnings?)[\s*_]*[:\u2014\u2013=][\s*_]*(.*)$")
 # The whole remainder must be a "none" answer; "yoklama ..." is still a learning.
+# A trailing parenthetical ("yok (rutin kontrol)") only explains the answer.
 _NO_LEARNING = re.compile(
     r"(?:(?:kalici\s+)?(?:öğrenim|ogrenim|ders)(?:ler)?\s+)?"
-    r"(?:yok(?:tur)?|hi[çc]\s+yok|hi[çc]biri|bulunmuyor|bulunmadi|none|nothing|no|n/?a|-+)")
+    r"(?:yok(?:tur)?|hi[çc]\s+yok|hi[çc]biri|bulunmuyor|bulunmadi|none|nothing|no|n/?a|-+)"
+    r"(?:\s*\([^()]*\))?")
 
 
 def _has_declared_learning(summary):
@@ -175,13 +180,15 @@ def _has_declared_learning(summary):
     return False
 
 
+# Agent concepts live in knowledge/; the official template keeps human-curated notes in 500-Knowledge/.
+_DISTILLATION_ROOTS = ("knowledge/", "🧠 500-Knowledge/", "500-Knowledge/")
 # Generated views and the V2 compiler seeds change without any agent distilling.
 _NOT_DISTILLATION = ("knowledge/v3/", "knowledge/index.md", "knowledge/log.md")
 
 
 def _is_distilled_note(relative):
     relative = relative.replace("\\", "/")
-    return (relative.startswith("knowledge/") and relative.endswith(".md") and
+    return (relative.startswith(_DISTILLATION_ROOTS) and relative.endswith(".md") and
             not any(relative == item or relative.startswith(item) for item in _NOT_DISTILLATION))
 
 
@@ -190,16 +197,19 @@ def _has_knowledge_update(vault, receipt, since):
         return False
     if any(isinstance(ref, str) and _is_distilled_note(ref) for ref in receipt.get("refs", [])):
         return True
-    k_dir = Path(vault) / "knowledge" if vault else None
-    if k_dir is None or not k_dir.is_dir():
+    if not vault:
         return False
-    for path in k_dir.rglob("*.md"):
-        try:
-            if (path.is_file() and not path.is_symlink() and path.stat().st_mtime >= since and
-                    _is_distilled_note(path.relative_to(vault).as_posix())):
-                return True
-        except (ValueError, OSError):
+    for root in _DISTILLATION_ROOTS:
+        k_dir = Path(vault) / root
+        if not k_dir.is_dir():
             continue
+        for path in k_dir.rglob("*.md"):
+            try:
+                if (path.is_file() and not path.is_symlink() and path.stat().st_mtime >= since and
+                        _is_distilled_note(path.relative_to(vault).as_posix())):
+                    return True
+            except (ValueError, OSError):
+                continue
     return False
 
 
@@ -326,13 +336,18 @@ def drain_queue(vault, state):
     if result.get("status") in ("ok", "succeeded", "synced", "degraded") and not result.get("conflicts"):
         (state / "hook-error.json").unlink(missing_ok=True)
         processed = 0
-        for path in pending:
-            (state / "hook-done").mkdir(parents=True, exist_ok=True)
-            try:
-                os.replace(path, state / "hook-done" / path.name)
-            except FileNotFoundError:
-                continue  # Another worker already atomically acknowledged this event.
-            processed += 1
+        # Acknowledge under the index's writer lock. On Windows two workers that both open a
+        # queued file before either moves it can both "succeed" (the second rename follows the
+        # moved file), so one event was counted twice once syncs got fast enough to overlap.
+        with engine.store._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            for path in pending:
+                (state / "hook-done").mkdir(parents=True, exist_ok=True)
+                try:
+                    os.replace(path, state / "hook-done" / path.name)
+                except FileNotFoundError:
+                    continue  # Another worker already atomically acknowledged this event.
+                processed += 1
         return {"processed": processed, "failed": 0, "pending": len(list((state / "hook-queue").glob("*.json")))}
     return {"processed": 0, "failed": len(pending), "pending": len(pending)}
 
@@ -340,7 +355,7 @@ def drain_queue(vault, state):
 def main():
     started = time.monotonic()
     if hasattr(sys.stdin, "reconfigure"):
-        sys.stdin.reconfigure(encoding="utf-8")
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser()
     parser.add_argument("--vault", required=True, type=Path)
     parser.add_argument("--state", required=True, type=Path)
@@ -366,6 +381,8 @@ def main():
         return
     notice = ''
     try:
+        # A payload cut at the read limit is not JSON: the handler below answers "{}" and
+        # records the error for doctor instead of silently dropping the turn.
         payload = json.loads(sys.stdin.read(1_000_000) or "{}")
         event = payload.get("hook_event_name", args.event)
         if args.harness == "hermes":
@@ -391,6 +408,13 @@ def main():
             from beyin_v3_releases import session_start
             notice = session_start(vault, state)
         settings = read(vault)
+        if event == 'SessionStart' and not args.metadata_only and (state / 'yakala.json').is_file():
+            # Opt-in capture queue (beyin.py yakala kur): one directory listing, never a model call.
+            try:
+                from beyin_v3_yakala import session_notice
+                notice += session_notice(vault)
+            except Exception:
+                pass
         if not args.metadata_only and event in ('SessionStart', 'PostToolUse') and (state / 'hygiene.json').is_file():
             # Opt-in hygiene signals (#130), machine-local in state/hygiene.json. Independent of the
             # performance profile, and never able to cost the session or the turn itself.
@@ -460,8 +484,11 @@ def main():
                 return
             if process is not None and process.returncode:
                 raise RuntimeError("Source sync failed; metadata remains queued")
-            from beyin_v3_sync import SyncEngine
-            store = SyncEngine(vault, state).store
+            # Context only reads the store. SyncEngine adds the Markdown journal and the
+            # markdown_sources table, which the sync worker creates and every reader tolerates
+            # missing, so the foreground skips importing the sync engine.
+            from beyin_v3 import MemoryStore
+            store = MemoryStore(state, vault)
             query = prompt_text(payload)
             project = payload.get('project')
             project = project if isinstance(project, str) and project.strip() else None
@@ -493,7 +520,8 @@ def main():
             else:
                 # Per-turn automatic context is strict: only meaningful lexical matches are
                 # injected, and an empty match injects nothing at all instead of a receipt
-                # header plus the newest unrelated notes.
+                # header plus the newest unrelated notes. Superseded and retired-status notes are
+                # dropped by the shared read gate before ranking (#201).
                 context = store.context_for(args.harness, query, project=project, budget_chars=limit, strict=True) if query else {"records": []}
                 inherited = False
                 from beyin_v3_continuity import resolve, remember

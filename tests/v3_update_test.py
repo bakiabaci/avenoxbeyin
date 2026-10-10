@@ -100,6 +100,58 @@ class OfflineUpdateTest(unittest.TestCase):
         self.assertEqual(core.read_bytes(), original)
         self.assertEqual(self.note.read_text(), 'User edit after system update.\n')
 
+    def test_update_lock_does_not_create_empty_sqlite_file(self):
+        import sqlite3
+        memory_db = self.state / 'memory.sqlite3'
+        self.assertFalse(memory_db.exists())
+        with self.module.locked(self.vault, self.state):
+            pass
+        self.assertFalse(memory_db.exists())
+
+    def test_update_lock_holds_runtime_writer_lock_for_uri_special_state_paths(self):
+        import sqlite3
+        import os
+        # '?' cannot appear in a Windows path; '#' and '%' still exercise the URI escaping there.
+        names = ('state #1', '100%25 state') + (() if os.name == 'nt' else ('q?x state',))
+        for name in names:
+            state = self.base / name
+            state.mkdir()
+            database = state / 'memory.sqlite3'
+            sqlite3.connect(database).close()
+            with self.module.locked(self.vault, state):
+                other = sqlite3.connect(database, timeout=0.1)
+                try:
+                    with self.assertRaises(sqlite3.OperationalError, msg=name):
+                        other.execute('BEGIN IMMEDIATE')
+                finally:
+                    other.close()
+
+    def test_rollback_preserves_original_file_mtime(self):
+        import os
+        core = self.vault / '.claude/scripts/beyin_v3.py'
+        old_time = 1500000000.0
+        os.utime(core, (old_time, old_time))
+        self.module.update(self.vault, self.state, self.package)
+        self.assertEqual(self.version(), '3.0.1')
+        self.module.rollback(self.vault, self.state)
+        self.assertEqual(self.version(), '3.0.0')
+        self.assertEqual(core.stat().st_mtime, old_time)
+
+    def test_rollback_keeps_new_mtime_of_merged_settings(self):
+        import os, time
+        config = self.vault / '.claude/settings.local.json'
+        old_time = 1500000000.0
+        os.utime(config, (old_time, old_time))
+        self.module.update(self.vault, self.state, self.package)
+        after = json.loads(config.read_text(encoding='utf-8'))
+        after['post_update_user_preference'] = 'kept'
+        config.write_text(json.dumps(after), encoding='utf-8')
+        before_rollback = time.time() - 5
+        self.module.rollback(self.vault, self.state)
+        # The merged file holds an edit made after the update; an old mtime would hide it.
+        self.assertEqual(json.loads(config.read_text(encoding='utf-8'))['post_update_user_preference'], 'kept')
+        self.assertGreater(config.stat().st_mtime, before_rollback)
+
     def test_interrupted_apply_keeps_old_version_and_recovers_once(self):
         def crash(phase, index=None):
             if phase == 'after_replace' and index == 0:
@@ -158,6 +210,15 @@ class OfflineUpdateTest(unittest.TestCase):
         before = snapshot(self.vault)
         with self.assertRaises(ValueError):
             self.module.update(self.vault, self.state, bad)
+        self.assertEqual(snapshot(self.vault), before)
+
+        def corrupt_missing(files):
+            metadata = json.loads(files['manifest.json'])
+            metadata['files']['scripts/beyin_entry.py'] = None
+            files['manifest.json'] = json.dumps(metadata).encode()
+        bad2 = rewrite_zip(self.package, self.base / 'corrupt2.zip', corrupt_missing)
+        with self.assertRaisesRegex(ValueError, 'package checksum mismatch'):
+            self.module.update(self.vault, self.state, bad2)
         self.assertEqual(snapshot(self.vault), before)
         self.assertEqual(self.version(), '3.0.0')
 
@@ -401,6 +462,51 @@ class OfflineUpdateTest(unittest.TestCase):
         cache.write_text(json.dumps({'schema': 1, 'checked_at': checked, 'attempted_at': checked,
                                      'next_check_at': checked + 86400, 'etag': '"old"', 'release': release, 'failures': 0}))
         self.assertEqual(doctor()['status'], 'ahead')
+
+    def test_windows_permission_error_restores_write_mode_during_apply(self):
+        file_path = self.vault / 'readonly_file.txt'
+        file_path.write_text('new content', encoding='utf-8')
+        os.chmod(file_path, stat.S_IREAD)
+        journal = {
+            'schema': 1,
+            'vault': str(self.vault),
+            'direction': 'rollback',
+            'operations': [
+                {
+                    'scope': 'vault',
+                    'name': 'readonly_file.txt',
+                    'old': self.module.encode(b'new content'),
+                    'new': self.module.encode(b'restored content')
+                }
+            ]
+        }
+        # POSIX replaces a read-only file; Windows refuses (WinError 5). Emulate that refusal so
+        # the test fails without the fix on every platform, not only on the Windows runner.
+        original_replace = os.replace
+        def windows_replace(source, destination):
+            if os.path.exists(destination) and not os.access(destination, os.W_OK):
+                raise PermissionError(13, 'Access is denied', str(destination))
+            return original_replace(source, destination)
+        with patch.object(self.module.os, 'replace', side_effect=windows_replace):
+            self.module._apply(self.vault, self.state, journal)
+        self.assertEqual(file_path.read_text(encoding='utf-8'), 'restored content')
+        self.assertFalse(os.access(file_path, os.W_OK), 'the read-only flag is the user\'s lock')
+
+    def test_update_and_rollback_keep_a_read_only_managed_file_locked(self):
+        version = self.vault / '.beyin-version'
+        os.chmod(version, stat.S_IREAD)
+        original_replace = os.replace
+        def windows_replace(source, destination):
+            if os.path.exists(destination) and not os.access(destination, os.W_OK):
+                raise PermissionError(13, 'Access is denied', str(destination))
+            return original_replace(source, destination)
+        with patch.object(self.module.os, 'replace', side_effect=windows_replace):
+            self.assertEqual(self.module.update(self.vault, self.state, self.package)['status'], 'updated')
+            self.assertEqual(self.version(), '3.0.1')
+            self.assertFalse(os.access(version, os.W_OK))
+            self.module.rollback(self.vault, self.state)
+        self.assertEqual(self.version(), '3.0.0')
+        self.assertFalse(os.access(version, os.W_OK))
 
 
 if __name__ == '__main__':
