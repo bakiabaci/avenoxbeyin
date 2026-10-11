@@ -1232,6 +1232,12 @@ def listen_mac(vault, script, keycode=11, modifiers=0x1000 | 0x800):
     """Carbon RegisterEventHotKey: global, no Accessibility permission, standard library only."""
     import ctypes
     from ctypes import CFUNCTYPE, POINTER, Structure, byref, c_int32, c_uint32, c_void_p
+    try:
+        objc, send = _objc()
+        app = send(objc.objc_getClass(b'NSApplication'), b'sharedApplication')
+        send(app, b'setActivationPolicy:', ctypes.c_void_p, ctypes.c_long(2))  # prohibited: background daemon, no Dock icon
+    except Exception:
+        pass
     carbon = ctypes.CDLL('/System/Library/Frameworks/Carbon.framework/Carbon')
 
     class HotKeyID(Structure):
@@ -1359,7 +1365,11 @@ def _launch_agent():
 
 
 def _listener_ok(wait=1.2):
-    """The listener exits at once when another app already owns the combination."""
+    """The listener exits at once when another app already owns the combination.
+
+    `launchctl print` also succeeds for a job that is loaded but stopped, so only
+    `state = running` counts.
+    """
     import time
     time.sleep(wait)
     probe = subprocess.run(['launchctl', 'print', 'gui/' + str(os.getuid()) + '/' + LAUNCH_LABEL], capture_output=True)
@@ -1454,7 +1464,7 @@ def install(vault, state, hotkey=True, spec=None, folder_spec=None):
         runner.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(script, runner)
         import plistlib
-        plist = {'Label': LAUNCH_LABEL, 'RunAtLoad': True, 'KeepAlive': {'SuccessfulExit': False},
+        plist = {'Label': LAUNCH_LABEL, 'RunAtLoad': True, 'KeepAlive': True,
                  'ProgramArguments': [sys.executable, str(runner), 'dinle', '--vault', str(vault),
                                       '--keycode', str(keycode), '--mods', str(modifiers)],
                  'ProcessType': 'Interactive', 'StandardErrorPath': str(state / 'yakala' / 'dinleyici.log'),
@@ -1527,8 +1537,7 @@ def status(vault, state):
     installed = _state_path(state).is_file()
     running = None
     if sys.platform == 'darwin' and _agent_vault() == str(Path(vault).resolve()):
-        probe = subprocess.run(['launchctl', 'print', 'gui/' + str(os.getuid()) + '/' + LAUNCH_LABEL], capture_output=True)
-        running = probe.returncode == 0
+        running = _listener_ok(wait=0)
     return {'status': 'tamam', 'kurulu': installed, 'dinleyici_calisiyor': running,
             'bekleyen': pending(vault, state), 'klasor': find_inbox(vault, state),
             'araclar': {name: bool(path) for name, path in tools().items()}}
@@ -1600,7 +1609,8 @@ def human(result, command):
         return 'Yakala kaldirildi. Yakalanan notlar yerinde duruyor.'
     if command == 'durum':
         return ('Kurulu: ' + ('evet' if result['kurulu'] else 'hayir') +
-                ('' if result['dinleyici_calisiyor'] is None else '\nKisayol dinleyicisi: ' + ('calisiyor' if result['dinleyici_calisiyor'] else 'durmus')) +
+                ('' if result['dinleyici_calisiyor'] is None else '\nKisayol dinleyicisi: ' +
+                 ('calisiyor' if result['dinleyici_calisiyor'] else 'durmus (baslatmak icin: beyin.py yakala kur)')) +
                 '\nBekleyen kaynak: ' + str(result['bekleyen']) +
                 '\nAraclar: ' + ', '.join(n + ('=var' if ok else '=yok') for n, ok in result['araclar'].items()))
     if result.get('status') == 'islendi':
