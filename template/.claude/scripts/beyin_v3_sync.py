@@ -346,10 +346,11 @@ class _SignatureCache:
 
     COLUMNS = 'source, id, size, mtime_ns, ctime_ns, ino, payload_sha256, seen_ns'
 
-    def __init__(self, db, sources, payloads):
+    def __init__(self, db, sources, payloads, full=False):
         self.db, self.sources, self.payloads = db, sources, payloads
         self.started = time.time_ns()
         self.rows, self.kept, self.pending = {}, {}, {}
+        self.full = full
         try:
             epoch = _signature_epoch()
         except (OSError, AttributeError, KeyError, TypeError):
@@ -375,7 +376,7 @@ class _SignatureCache:
     def lookup(self, relative, st):
         """The indexed id when the source need not be read, else None."""
         row = self.rows.get(relative)
-        if row is None or not row[5] or row[1:5] != _stat_signature(st):
+        if self.full or row is None or not row[5] or row[1:5] != _stat_signature(st):
             return None
         id, payload = row[0], self.payloads.get(row[0])
         if payload is None or self.sources.get(id) != relative or _hash(payload) != row[5]:
@@ -853,7 +854,8 @@ class SyncEngine:
             db.execute("INSERT OR REPLACE INTO metadata VALUES ('receipt_scan_signature',?)", (signature,))
         return warnings, conflicts
 
-    def sync(self):
+    def sync(self, full=False):
+        """Index the vault. `full` reads every source: no stored stat signature is taken on trust."""
         # Serialize recovery, source scan and projection across local processes.
         with self.store._connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -863,7 +865,7 @@ class SyncEngine:
             # Match the old covering-ID scan's set construction and deletion event order.
             old_owned = {id for id in old_sources}
             old_payloads = dict(db.execute('SELECT id, payload FROM records'))
-            cache = _SignatureCache(db, old_sources, old_payloads)
+            cache = _SignatureCache(db, old_sources, old_payloads, full=full)
             records, warnings, conflicts = self._scan(cache)
             warnings.extend(receipt_warnings)
             conflicts.extend(recovery_conflicts + receipt_conflicts)

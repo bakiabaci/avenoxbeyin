@@ -455,6 +455,54 @@ class StatSignatureTest(unittest.TestCase):
             self.engine.sync()
         self.assertEqual(calls, [])
 
+    def test_a_full_sync_reads_what_no_stat_can_show(self):
+        # The limit of any stat cache: an in-place edit of the same size with its mtime put back,
+        # on a filesystem without a change time (FAT, exFAT; os.stat on Windows). A normal sync
+        # cannot see it; retrieval still refuses the record (its hash is not the source's), and
+        # `sync --full` reads everything.
+        path = self.write()
+        self.write('notes/other.md', id='other')
+        with patch.object(subject, '_stat_signature', coarse_signature):
+            self.settle()
+            before = path.stat()
+            self.rewrite_same_size(path, b'Alpha', b'Omega')
+            self.put_back(path, before)
+            with self.reads() as calls, self.later():
+                self.engine.sync()
+            self.assertEqual(calls, [])
+            self.assertEqual(self.record('note')['text'], 'Alpha calibration.\n')
+            self.assertEqual(self.engine.store._eligible()[1], 1)
+            with self.later():
+                self.oracle.sync()
+            with self.reads() as calls, self.later():
+                result = self.engine.sync(full=True)
+            self.assertEqual(sorted(set(calls)), ['note.md', 'other.md'])
+            self.assertEqual(result['status'], 'succeeded')
+            self.assertEqual(self.snapshot(self.engine), self.snapshot(self.oracle))
+            self.assert_index_is_fresh()
+            self.assertEqual(self.engine.store._eligible()[1], 0)
+            # A full sync settles what it read like any other read.
+            with self.reads() as calls, self.later():
+                self.engine.sync()
+            self.assertEqual(calls, [])
+
+    def test_cli_sync_full(self):
+        path = self.write()
+        cli_state = self.root / 'cli-state'
+
+        def run(*arguments):
+            result = subprocess.run([sys.executable, str(CLI), '--vault', str(self.vault), '--state', str(cli_state), 'sync', *arguments],
+                                    capture_output=True, text=True, encoding='utf-8', env=inherited_env())
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout)
+
+        self.assertEqual(run()['indexed'], 1)
+        self.rewrite_same_size(path, b'Alpha', b'Omega')
+        self.assertEqual(run('--full')['status'], 'succeeded')
+        with subject.SyncEngine(self.vault, cli_state).store._connect() as db:
+            payload, = db.execute("SELECT payload FROM records WHERE id='note'").fetchone()
+        self.assertEqual(json.loads(payload)['text'], 'Omega calibration.\n')
+
 
 def _load(name):
     spec = importlib.util.spec_from_file_location('v3_sync_stat_' + name, SCRIPTS / (name + '.py'))
