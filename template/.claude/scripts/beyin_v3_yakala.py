@@ -769,7 +769,7 @@ def _tool_text(command):
     if result.returncode != 0:
         return ''
     text = result.stdout[:CLIP_LIMIT].decode('utf-8', 'replace')
-    return text.rstrip('�') + CLIP_CUT if len(result.stdout) > CLIP_LIMIT else text
+    return text.rstrip('\ufffd') + CLIP_CUT if len(result.stdout) > CLIP_LIMIT else text
 
 
 def _wl_paste():
