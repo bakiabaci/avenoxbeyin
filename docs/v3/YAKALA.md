@@ -67,7 +67,8 @@ kısayol kurulmaz, kaldırırken de masaüstündeki kısayol ayarı yerinde kal�
 Pencere neyi kaydedeceğini panodan okur: Wayland'da `wl-clipboard` paketi (`wl-paste`), X11'de
 `xclip` ya da `xsel` gerekir; yoksa pano okunamaz. Panoda tek bir bağlantı varsa bağlantı, dosya
 yöneticisinden kopyalanan dosyalar (`file://` listesi) varsa dosyalar, başka metin varsa metin
-yakalanır. Yalnız görsel kopyalandıysa pano boş sayılır; panodan en fazla 1 MB metin alınır.
+yakalanır. Yalnız görsel kopyalandıysa pano boş sayılır; bu araçlarla okunan metnin en fazla 1 MB'ı
+alınır ve kartta kesildiği yazar.
 Kopyalanan dosyaların yakalanması gerçek masaüstünde denenmedi, yalnız birim testleri var.
 
 Tam pencere `tkinter` ister. Arch tabanlı dağıtımlarda Python'un `tk` paketi ayrıdır
