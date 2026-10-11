@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -736,6 +737,32 @@ class StatSignatureTest(unittest.TestCase):
             self.sync_both()
             self.assertEqual(self.last_reads, ['note.md', 'note.md'])
             self.assertEqual(self.signatures()['notes/note.md'][0], '')
+
+    def test_signatures_are_saved_without_sqlite_json_functions(self):
+        # The row-by-row fallback of save(), for an SQLite built without json_each.
+        class WithoutJson:
+            def __init__(self, db):
+                self.db = db
+
+            def execute(self, sql, *parameters):
+                if 'json_each' in sql:
+                    raise sqlite3.OperationalError('no such table: json_each')
+                return self.db.execute(sql, *parameters)
+
+            def executemany(self, sql, rows):
+                return self.db.executemany(sql, rows)
+
+        cache = subject._SignatureCache
+        self.write()
+        gone = self.write('notes/gone.md', id='gone')
+        with patch.object(subject, '_SignatureCache', lambda db, *args, **kwargs: cache(WithoutJson(db), *args, **kwargs)):
+            self.settle()
+            self.assertEqual({source: len(row[0]) for source, row in self.signatures().items()},
+                             {'notes/note.md': 64, 'notes/gone.md': 64})
+            gone.unlink()
+            self.assertEqual(self.sync_both()['deleted'], 1)
+            self.assertEqual(self.last_reads, [])
+            self.assertEqual(set(self.signatures()), {'notes/note.md'})
 
     def test_a_sync_that_fails_before_commit_leaves_no_signature_behind(self):
         # Records and signatures are one transaction: neither survives without the other.
