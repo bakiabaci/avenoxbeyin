@@ -266,6 +266,18 @@ def pending(vault, state=None):
     return count
 
 
+def _local_only(folder):
+    """Raw text and captured files stay out of a versioned vault, whichever folder holds the cards."""
+    folder.mkdir(parents=True, exist_ok=True)
+    ignore = folder / '.gitignore'
+    if not ignore.exists():
+        try:
+            ignore.write_text('*\n', encoding='utf-8', newline='\n')
+        except OSError:
+            pass
+    return folder
+
+
 def _unique(path):
     path = Path(path)
     if not path.exists():
@@ -306,8 +318,7 @@ def capture(vault, url=None, text=None, files=(), why='', app=None, title=None, 
     for source in files:
         if not source.is_file():
             raise ValueError('Dosya bulunamadi: ' + str(source))
-        target = _unique(folder / FILES / source.name)
-        target.parent.mkdir(parents=True, exist_ok=True)
+        target = _unique(_local_only(folder / FILES) / source.name)
         shutil.copy2(source, target)
         copied.append(target.relative_to(vault).as_posix())
     name = stamp.strftime('%Y-%m-%d-%H%M') + '-' + (url_slug(url) if url and title == url else slug(title))
@@ -594,8 +605,7 @@ def process(vault, card_ids=None, allow_audio=True, retry=False, state=None):
         meta.update({target: info[source] for source, target in (('author', 'yazar'), ('published', 'yayin'), ('site', 'site'))
                      if info.get(source)})
         if text:
-            raw = card['path'].parent / RAW / (card['id'] + '.md')
-            raw.parent.mkdir(parents=True, exist_ok=True)
+            raw = _local_only(card['path'].parent / RAW) / (card['id'] + '.md')
             header = ['---', 'tur: yakala-ham', 'kart: ' + json.dumps(entry['kart'], ensure_ascii=False),
                       'baslik: ' + json.dumps(meta.get('baslik') or '', ensure_ascii=False),
                       'url: ' + json.dumps(meta.get('url') or '', ensure_ascii=False),

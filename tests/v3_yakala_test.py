@@ -352,6 +352,18 @@ class YakalaInboxTest(unittest.TestCase):
             (self.state / 'yakala.json').write_text('{"schema": 1, "klasor": ' + saved + '}\n', encoding='utf-8')
             self.assertEqual(yakala.find_inbox(self.vault, self.state), '00_INBOX/Yakala', saved)
 
+    def test_raw_text_and_files_stay_out_of_git_in_any_folder(self):
+        none = {name: None for name in ('npx', 'yt_dlp', 'whisper', 'pdftotext', 'ffmpeg')}
+        source = Path(self.tmp.name) / 'not.txt'
+        source.write_text('dosyadaki ders', encoding='utf-8')
+        yakala.install(self.vault, self.state, hotkey=False, folder_spec='Notlar/Kaynaklar')
+        yakala.capture(self.vault, files=[source], state=self.state)
+        with patch.object(yakala, 'tools', return_value=none):
+            result = yakala.process(self.vault, state=self.state)
+        self.assertEqual([entry['ham'].rsplit('/', 1)[0] for entry in result['kartlar']], ['Notlar/Kaynaklar/.ham'])
+        for private in ('.ham', 'dosyalar'):
+            self.assertEqual((self.vault / 'Notlar/Kaynaklar' / private / '.gitignore').read_text(encoding='utf-8'), '*\n')
+
     def test_nfd_folder_name_round_trips(self):
         import unicodedata
         nfc = 'Günlük Inbox'

@@ -94,7 +94,8 @@ python3 beyin.py yakala kur --klasor "Notlar/Yakala"
 | PDF, metin dosyası | `pdftotext` ya da doğrudan okuma; görselleri ajan açar |
 
 Ham metin kart klasörünün içinde `.ham/` altında durur. Nokta ile başlayan klasör olduğu için
-aramaya ve Obsidian'a karışmaz, `.gitignore` ile depoya da girmez.
+aramaya ve Obsidian'a karışmaz. `.ham/` ve yakalanan dosyaların durduğu `dosyalar/`, içlerine yazılan
+`.gitignore` ile kart klasörü hangisi olursa olsun depoya da girmez.
 
 ### İsteğe bağlı araçlar
 
