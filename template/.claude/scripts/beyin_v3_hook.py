@@ -66,8 +66,9 @@ def _safe_replace(source, destination):
     """os.replace, retried briefly only for a Windows sharing violation.
 
     An antivirus scan, the search indexer or an editor can hold the target open for a few
-    milliseconds there (WinError 5/32/33). A POSIX PermissionError is a real EACCES/EPERM
-    and is raised at once, as is any other error.
+    milliseconds there (WinError 5/32/33): four retries, 225 ms in all. A POSIX
+    PermissionError is a real EACCES/EPERM and is raised at once, as is any other error and
+    WinError 5 for a read-only target, which no wait will lift (#230).
     """
     attempts = 5 if os.name == "nt" else 1
     for attempt in range(attempts):
@@ -75,7 +76,8 @@ def _safe_replace(source, destination):
             os.replace(source, destination)
             return
         except PermissionError as exc:
-            if attempt == attempts - 1 or getattr(exc, "winerror", None) not in (5, 32, 33):
+            if (attempt == attempts - 1 or getattr(exc, "winerror", None) not in (5, 32, 33)
+                    or (os.path.exists(destination) and not os.access(destination, os.W_OK))):
                 raise
             time.sleep(0.015 * (2 ** attempt))
 
