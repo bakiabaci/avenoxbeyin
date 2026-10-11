@@ -666,25 +666,39 @@ def _try(command, timeout=5):
         return None, ''
 
 
+def _linux_clipboard():
+    """Clipboard text through one helper: wl-paste on Wayland (the reader the window uses), else xclip or xsel."""
+    text = _wl_paste()
+    if text is None:
+        for name, options in (('xclip', ['-o', '-selection', 'clipboard']), ('xsel', ['-ob'])):
+            tool = _which(name)
+            if tool:
+                text = _tool_text([tool] + options)
+                break
+    return repair_mojibake(text or '')
+
+
+def _file_uri_path(line):
+    """Path of a local file:// URI; None for other text and for a URI that names another machine."""
+    match = re.fullmatch(r'file://(?:localhost)?(/.*)', line)
+    return unquote(match.group(1)) if match else None
+
+
 def linux_context():
-    """The clipboard is the only portable source on Linux: a link, copied files or plain text."""
-    if os.environ.get('WAYLAND_DISPLAY') and _which('wl-paste'):
-        command = ['wl-paste', '--no-newline']
-    elif _which('xclip'):
-        command = ['xclip', '-o', '-selection', 'clipboard']
-    elif _which('xsel'):
-        command = ['xsel', '-ob']
-    else:
-        return {}
-    code, out = _try(command, timeout=2.5)
-    text = out.strip() if code == 0 else ''
+    """The clipboard is the only portable source on Linux: a link, copied files or plain text.
+
+    Read like the window reads it on macOS and Windows: only a clipboard that is one link is a
+    link. A link followed by more lines is text, so nothing after the first line is dropped.
+    """
+    text = _linux_clipboard().strip()
     if not text:
         return {}
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if re.fullmatch(r'https?://\S+', lines[0]):
-        return {'url': lines[0]}
-    if all(line.startswith('file://') for line in lines):  # Dolphin/Nautilus copy files as URIs
-        paths = [unquote(urlparse(line).path) for line in lines]
+    if re.fullmatch(r'https?://\S+', text):
+        return {'url': text}
+    # File managers copy files as a text/uri-list: one file:// URI per line, '#' lines are comments.
+    lines = [line.strip() for line in text.splitlines()]
+    paths = [_file_uri_path(line) for line in lines if line and not line.startswith('#')]
+    if paths and all(paths):
         paths = [path for path in paths if Path(path).is_file()]
         return {'dosyalar': paths[:20]} if paths else {}
     return {'metin': text}
@@ -1054,14 +1068,38 @@ def popup(vault, context=None):
     return result or {'status': 'vazgecildi'}
 
 
-def _linux_ask(prompt):
-    """Reason typed in kdialog/zenity; None when cancelled, '' when neither tool exists."""
-    for command in (['kdialog', '--title', 'Beyne at', '--inputbox', prompt, ''],
-                    ['zenity', '--entry', '--title', 'Beyne at', '--text', prompt]):
-        if _which(command[0]):
-            code, out = _try(command, timeout=300)
-            return out.strip() if code == 0 else None
-    return ''
+LINUX_NO_WINDOW = ('Pencere acilamiyor: bu Python\'da tkinter yok, kdialog ya da zenity de kurulu degil. Birini kur '
+                   '(Arch: sudo pacman -S tk, Debian/Ubuntu: sudo apt install python3-tk) ya da beyin.py yakala ekle kullan.')
+
+
+def _linux_window():
+    """What can show the window here: 'tkinter', the path of kdialog or zenity, or None."""
+    try:
+        import tkinter  # noqa: F401
+        return 'tkinter'
+    except ImportError:
+        return _which('kdialog', 'zenity')
+
+
+def _linux_ask(shown=''):
+    """Reason typed in kdialog or zenity; None when cancelled. Neither tool: an error, nothing is saved unseen.
+
+    `shown` comes from the clipboard. It is never an argument of its own and never the start of one:
+    it follows the fixed question inside the value of --inputbox / --text. That fixed first line also
+    keeps Qt from reading the label as rich text. Both tools expand backslash escapes, and zenity
+    drops a single underscore as a mnemonic (--entry has no Pango markup), hence the doubling.
+    """
+    shown = re.sub(r'[\x00-\x1f\x7f]+', ' ', str(shown)).strip()[:120].replace('\\', '\\\\')
+    kdialog, zenity = _which('kdialog'), _which('zenity')
+    if kdialog:
+        command = [kdialog, '--title', 'Beyne at', '--inputbox', 'Neden kaydediyorsun?' + ('\n' + shown if shown else ''), '']
+    elif zenity:
+        command = [zenity, '--entry', '--title', 'Beyne at', '--text',
+                   'Neden kaydediyorsun?' + ('\n' + shown.replace('_', '__') if shown else '')]
+    else:
+        raise ValueError(LINUX_NO_WINDOW)
+    code, out = _try(command, timeout=300)
+    return out.strip() if code == 0 else None
 
 
 def _popup_fallback(vault, context):
@@ -1071,8 +1109,7 @@ def _popup_fallback(vault, context):
     if sys.platform == 'darwin':
         why = _osascript('text returned of (display dialog "Neden kaydediyorsun?" default answer "" with title "Beyne at")', timeout=300) or ''
     elif sys.platform.startswith('linux'):
-        shown = url or ', '.join(Path(f).name for f in files) or text
-        why = _linux_ask('Neden kaydediyorsun?' + ('\n' + shown[:120] if shown else ''))
+        why = _linux_ask(url or ', '.join(Path(f).name for f in files) or text)
         if why is None:
             return {'status': 'vazgecildi'}
     if not (url or files or text or why):
@@ -1291,7 +1328,7 @@ description: Kullanıcının yakaladığı kaynakları (YouTube videosu, tweet, 
 
 # Beyne at: yakalanan kaynakları işle
 
-Kullanıcı kaynakları tek tuşla yakalar: kısayol (Mac'te Control+Option+B, Windows ve Linux'ta Ctrl+Alt+B),
+Kullanıcı kaynakları tek tuşla yakalar: kısayol (Mac'te Control+Option+B, Windows'ta Ctrl+Alt+B, Linux'ta KDE ve GNOME'da Ctrl+Alt+B),
 tarayıcıda Obsidian Web Clipper'ın "Beyne at" şablonu ya da Windows'ta sağ tık > Gönder > Beyne At.
 Her yakalama `📥 000-Inbox/Yakala/` içinde tek bir karttır. Kartın `## Neden` bölümü kullanıcının
 niyetidir; dersleri o niyete göre seç.
@@ -1418,8 +1455,9 @@ KDE_ACTION = "['beyne-at.desktop','_launch','Beyne At','Beyne At']"
 
 
 def _desktop_file():
-    data = os.environ.get('XDG_DATA_HOME') or str(Path.home() / '.local/share')
-    return Path(data) / 'applications' / DESKTOP_NAME
+    data = os.environ.get('XDG_DATA_HOME') or ''
+    # The basedir spec: a relative XDG_DATA_HOME is invalid and ignored (it would land under the working directory).
+    return (Path(data) if os.path.isabs(data) else Path.home() / '.local/share') / 'applications' / DESKTOP_NAME
 
 
 def _linux_desktop():
@@ -1427,21 +1465,36 @@ def _linux_desktop():
     return 'kde' if 'KDE' in current else 'gnome' if 'GNOME' in current else None
 
 
+def _desktop_string(value):
+    """String value of a desktop entry: backslash, newline, tab and carriage return are escaped."""
+    return str(value).replace('\\', '\\\\').replace('\n', '\\n').replace('\t', '\\t').replace('\r', '\\r')
+
+
 def _desktop_quote(arg):
     """Exec argument per the Desktop Entry spec, then the string-value escaping of the file itself."""
     arg = str(arg)
-    if re.search(r'[\s"\'\\><~|&;$*?#()`%]', arg):
+    if not arg or re.search(r'[\s"\'\\><~|&;$*?#()`%]', arg):
         arg = '"' + re.sub(r'(["`$\\])', r'\\\1', arg).replace('%', '%%') + '"'
-    return arg.replace('\\', '\\\\')
+    return _desktop_string(arg)
+
+
+def _desktop_entry(argv, vault):
+    """The launcher file. X-Beyin-Vault names the vault it serves; `kaldir` and `durum` touch only their own."""
+    return ('[Desktop Entry]\nType=Application\nName=Beyne at\nComment=İkinci beyne kaynak yakala\n'
+            'Exec=' + ' '.join(_desktop_quote(a) for a in argv) + '\nTerminal=false\nCategories=Utility;\n'
+            'X-Beyin-Vault=' + _desktop_string(vault) + '\n')
 
 
 def _desktop_owner(path):
+    """Vault the entry at `path` serves; None when it is missing, unreadable or not written by `kur`."""
     try:
-        for line in path.read_text(encoding='utf-8').splitlines():
-            if line.startswith('X-Beyin-Vault='):
-                return line.split('=', 1)[1]
-    except OSError:
-        pass
+        lines = Path(path).read_text(encoding='utf-8').split('\n')
+    except (OSError, UnicodeDecodeError):
+        return None
+    unescape = {'n': '\n', 't': '\t', 'r': '\r', 's': ' '}
+    for line in lines:
+        if line.startswith('X-Beyin-Vault='):
+            return re.sub(r'\\(.)', lambda match: unescape.get(match.group(1), match.group(1)), line.split('=', 1)[1])
     return None
 
 
@@ -1452,13 +1505,20 @@ def _gnome_list():
     try:
         import ast
         value = ast.literal_eval(out.strip().replace('@as ', '', 1))
-        return list(value) if isinstance(value, (list, tuple)) else None
-    except (ValueError, SyntaxError):
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
         return None
+    # Anything but a list of strings is not rewritten: the user's own bindings live in it.
+    return list(value) if isinstance(value, list) and all(isinstance(item, str) for item in value) else None
+
+
+def _gvariant(text):
+    """GVariant text of a string. A bare value that starts with a quote makes `gsettings set` fail."""
+    return "'" + str(text).replace('\\', '\\\\').replace("'", "\\'") + "'"
 
 
 def _gnome_set_list(paths):
-    return _try(['gsettings', 'set', GNOME_KEYS, 'custom-keybindings', repr(list(paths))])[0] == 0
+    value = '[' + ', '.join(_gvariant(path) for path in paths) + ']'
+    return _try(['gsettings', 'set', GNOME_KEYS, 'custom-keybindings', value])[0] == 0
 
 
 def _gnome_schema():
@@ -1468,6 +1528,18 @@ def _gnome_schema():
 def _kde_active():
     code, out = _try(KGLOBAL + ['-o', '/component/beyne_at_desktop', '-m', 'org.kde.kglobalaccel.Component.isActive'])
     return code == 0 and 'true' in out
+
+
+def _hand_over(vault, state):
+    """The desktop entry starts the copy in the state folder. When the vault has its own module, run that
+    one, so an update reaches the window without a second `kur` (the macOS listener does the same)."""
+    here = Path(__file__).resolve()
+    current = Path(vault) / '.claude/scripts' / here.name
+    if here == (Path(state) / 'yakala' / here.name).resolve() and current.is_file() and current.resolve() != here:
+        try:
+            os.execv(sys.executable, [sys.executable, str(current)] + sys.argv[1:])
+        except OSError:
+            pass  # the copy still opens the window
 
 
 def _linux_hotkey_install(kde, qt, gnome, command):
@@ -1492,7 +1564,7 @@ def _linux_hotkey_install(kde, qt, gnome, command):
             return False
         schema = _gnome_schema()
         for key, value in (('name', 'Beyne at'), ('command', command), ('binding', gnome)):
-            if _try(['gsettings', 'set', schema, key, value])[0] != 0:
+            if _try(['gsettings', 'set', schema, key, _gvariant(value)])[0] != 0:
                 return False
         return GNOME_PATH in (_gnome_list() or [])
     return None
@@ -1566,16 +1638,22 @@ def install(vault, state, hotkey=True, spec=None):
         shutil.copy2(script, runner)
         argv = [sys.executable, str(runner), 'pencere', '--vault', str(vault)]
         entry = _desktop_file()
+        previous = _desktop_owner(entry)
+        if previous and previous != str(vault):
+            done['onceki_vault'] = previous  # the hotkey moves to this vault
         entry.parent.mkdir(parents=True, exist_ok=True)
-        entry.write_text('[Desktop Entry]\nType=Application\nName=Beyne at\nComment=Ikinci beyne kaynak yakala\n'
-                         'Exec=' + ' '.join(_desktop_quote(a) for a in argv) + '\nTerminal=false\nCategories=Utility;\n'
-                         'X-Beyin-Vault=' + str(vault) + '\n', encoding='utf-8')
+        entry.write_text(_desktop_entry(argv, vault), encoding='utf-8', newline='\n')
         import shlex
-        running = _linux_hotkey_install(kde_key, qt_key, gnome_key, shlex.join(argv))
+        command = shlex.join(argv)
+        running = _linux_hotkey_install(kde_key, qt_key, gnome_key, command)
         if running is None:
-            done['ipucu'] = 'Masaustu ayarlarindan su komuta bir kisayol bagla: ' + shlex.join(argv)
+            done['ipucu'] = 'Masaustu ayarlarindan su komuta bir kisayol bagla: ' + command
         else:
             done.update(kisayol=label, kisayol_calisiyor=running)
+            if not running:  # a missing tool or a refused call is not an error: the command still works by hand
+                done['ipucu'] = 'Kisayol dogrulanamadi; calismiyorsa masaustu ayarlarindan su komuta elle bagla: ' + command
+        if not _linux_window():
+            done['uyari'] = LINUX_NO_WINDOW
     elif hotkey and os.name == 'nt':
         pythonw = Path(sys.executable).with_name('pythonw.exe')
         target = pythonw if pythonw.is_file() else Path(sys.executable)
@@ -1710,6 +1788,8 @@ def human(result, command):
             lines.append('UYARI: kisayol dinleyicisi baslamadi; bu tus baska bir uygulamada kayitli olabilir. Baska bir tus dene.')
         if result.get('ipucu'):
             lines.append(result['ipucu'])
+        if result.get('uyari'):
+            lines.append('UYARI: ' + result['uyari'])
         if command == 'kisayol':
             return '\n'.join(lines)
         if result.get('gonder_menusu'):
@@ -1784,6 +1864,8 @@ def main(argv=None, vault=None, state=None):
     command = args.command or 'pencere'
     as_json = args.force_json or not sys.stdout or not sys.stdout.isatty()
     if command == 'pencere':
+        if argv is None and sys.platform.startswith('linux'):
+            _hand_over(vault, state)  # started by the hotkey from the state copy
         context = json.loads(args.baglam) if getattr(args, 'baglam', None) else gather_context()
         result = popup(vault, context)
     elif command == 'dinle':
