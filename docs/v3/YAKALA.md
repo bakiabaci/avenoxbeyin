@@ -64,8 +64,9 @@ ve kısayolu siler. Masaüstü `XDG_CURRENT_DESKTOP` değişkeninden tanınır; 
 masaüstü oturumundaki bir terminalden çalıştır. SSH gibi bu değişkenin olmadığı bir oturumda
 kısayol kurulmaz, kaldırırken de masaüstündeki kısayol ayarı yerinde kalır.
 
-Pencere neyi kaydedeceğini panodan okur: Wayland'da `wl-clipboard` paketi (`wl-paste`), X11'de
-`xclip` ya da `xsel` gerekir; yoksa pano okunamaz. Panoda tek bir bağlantı varsa bağlantı, dosya
+Pencere neyi kaydedeceğini panodan okur: Wayland'da `wl-clipboard` paketi (`wl-paste`) gerekir.
+X11'de tam pencere metni kendisi okur; kopyalanan dosyalar ve `kdialog`/`zenity` yolu için `xclip`
+ya da `xsel` gerekir. Panoda tek bir bağlantı varsa bağlantı, dosya
 yöneticisinden kopyalanan dosyalar (`file://` listesi) varsa dosyalar, başka metin varsa metin
 yakalanır. Yalnız görsel kopyalandıysa pano boş sayılır; bu araçlarla okunan metnin en fazla 1 MB'ı
 alınır ve kartta kesildiği yazar.
