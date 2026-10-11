@@ -1,7 +1,7 @@
 """Windows side of the capture tool (yakala): console output and the hotkey listener (#268).
 
-Three layers. The output tests imitate a legacy Windows console with PYTHONIOENCODING and run
-on every OS. The flow tests drive the listener against an in-memory model of the few Win32
+Three layers. The output tests set the console's encoding with PYTHONIOENCODING and run on
+every OS. The flow tests drive the listener against an in-memory model of the few Win32
 calls it makes, so its rules (one listener per logon session, stop by name, status only after
 the key is registered) hold everywhere. The Windows-only tests call the real API: RegisterHotKey,
 the named mutex and event, and shortcuts written through WScript.Shell. They skip, with a line
@@ -9,9 +9,11 @@ on stderr, when the session cannot register a hotkey at all (no interactive desk
 """
 import base64
 import ctypes
+import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -27,6 +29,7 @@ SCRIPTS = ROOT / 'template/.claude/scripts'
 MODULE = SCRIPTS / 'beyin_v3_yakala.py'
 INBOX = '📥 000-Inbox/Yakala'
 KEY = 'ctrl+alt+shift+f9'  # unlikely to be taken on a developer machine or a CI runner
+UTF8 = ('utf-8', 'utf8', 'UTF8', 'cp65001')  # one encoding under the names a stream may report
 WINDOWS = os.name == 'nt'
 sys.path.insert(0, str(SCRIPTS))
 import beyin_v3_yakala as yakala  # noqa: E402
@@ -42,7 +45,8 @@ def wait_until(check, seconds=30.0):
 
 
 class ConsoleOutputTest(unittest.TestCase):
-    """A piped Windows console is cp1254 or cp1252; neither can encode the inbox emoji."""
+    """A piped Windows console is cp1254 or cp1252; neither can encode the inbox emoji. A UTF-8
+    stream (macOS, Linux, PYTHONUTF8) keeps the characters as 3.9.0 printed them."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='v3-yakala-out-')
@@ -59,30 +63,54 @@ class ConsoleOutputTest(unittest.TestCase):
     def entry(self, encoding, *args):
         result = subprocess.run([sys.executable, str(self.vault / 'beyin.py'), 'yakala', *args], capture_output=True,
                                 env=dict(self.env, PYTHONIOENCODING=encoding), cwd=self.vault, timeout=120)
-        self.assertEqual(result.returncode, 0, (args, result.stderr))
-        # ASCII bytes mean the same under every decoder a caller may use for the pipe.
-        self.assertTrue(result.stdout.isascii(), (args, result.stdout[:200]))
-        decoded = {codec: json.loads(result.stdout.decode(codec)) for codec in ('cp1254', 'cp1252', 'utf-8')}
-        self.assertEqual(decoded['cp1254'], decoded['utf-8'])
-        self.assertEqual(decoded['cp1252'], decoded['utf-8'])
-        return decoded['utf-8']
+        self.assertEqual(result.returncode, 0, (encoding, args, result.stderr))
+        self.raw = result.stdout
+        if encoding in UTF8:
+            # Literal characters: nobody reads a card title as a row of \u escapes.
+            self.assertIsNone(re.search(rb'(?<!\\)\\u[0-9a-fA-F]{4}', result.stdout), (encoding, args))
+        else:
+            # ASCII bytes mean the same under every decoder a caller may use for the pipe.
+            self.assertTrue(result.stdout.isascii(), (encoding, args, result.stdout[:200]))
+        return json.loads(result.stdout.decode('utf-8'))
 
-    def test_json_output_survives_legacy_code_pages(self):
-        note = 'Şifre ve Müşteri Arşiv notu, Iğdır'
-        for number, encoding in enumerate(('cp1254', 'cp1252'), 1):
+    def carries(self, encoding, text):
+        """`text` as the last output must hold it: itself on UTF-8, its JSON escapes on a code page."""
+        self.assertIn(text.encode('utf-8') if encoding in UTF8 else json.dumps(text)[1:-1].encode('ascii'), self.raw)
+
+    def test_json_is_readable_on_utf8_and_ascii_on_legacy_code_pages(self):
+        note, encodings = 'Şifre ve Müşteri Arşiv notu, Iğdır', ('utf-8', 'cp1254', 'cp1252')
+        for number, encoding in enumerate(encodings, 1):
             with self.subTest(encoding=encoding):
+                text = note + ' ' + str(number)
                 installed = self.entry(encoding, 'kur', '--kisayol-yok')
+                self.carries(encoding, INBOX)
                 self.assertEqual(installed['klasor'], INBOX)
                 self.assertTrue((self.vault / installed['web_clipper_sablonu']).is_file())
-                added = self.entry(encoding, 'ekle', '--metin', note + ' ' + str(number))
+                added = self.entry(encoding, 'ekle', '--metin', text)
                 self.assertTrue(added['path'].startswith(INBOX + '/'), added['path'])
                 self.assertTrue((self.vault / added['path']).is_file())
                 listed = self.entry(encoding, 'liste')
+                self.carries(encoding, text)
                 # A command that failed after writing its card left a second card on the retry.
-                self.assertEqual(listed['bekleyen'], number)
-                self.assertIn(note + ' ' + str(number), [card['baslik'] for card in listed['kartlar']])
+                self.assertEqual(listed['bekleyen'], 1)
+                self.assertIn(text, [card['baslik'] for card in listed['kartlar']])
+                processed = self.entry(encoding, 'isle', '--ses-yok')  # a typed note: nothing is fetched
+                self.assertEqual([(card['id'], card['durum']) for card in processed['kartlar']], [(added['id'], 'cikarildi')])
+                self.assertTrue(processed['kartlar'][0]['ham'].startswith(INBOX + '/.ham/'), processed['kartlar'][0])
                 self.assertEqual(self.entry(encoding, 'durum')['klasor'], INBOX)
                 self.assertEqual(self.entry(encoding, 'sablon')['path'], INBOX)
+        # Whatever the stream, the same values: the read-only commands, once per encoding.
+        for command in (['liste'], ['liste', '--durum', 'cikarildi'], ['durum'], ['sablon']):
+            first, *others = [self.entry(encoding, *command) for encoding in encodings]
+            self.assertEqual(others, [first, first], command)
+        self.assertEqual(len(self.entry('cp1254', 'liste', '--durum', 'cikarildi')['kartlar']), 3)
+
+    def test_the_stream_decides_not_the_platform(self):
+        self.entry('utf-8', 'kur', '--kisayol-yok')
+        for encoding in UTF8 + ('cp857', 'ascii', 'latin-1'):
+            with self.subTest(encoding=encoding):
+                self.assertEqual(self.entry(encoding, 'durum')['klasor'], INBOX)
+                self.carries(encoding, INBOX)
 
     def test_durum_writes_nothing(self):
         self.entry('utf-8', 'kur', '--kisayol-yok')
@@ -119,6 +147,28 @@ class ConsoleOutputTest(unittest.TestCase):
         self.assertEqual(process.returncode, 0, error)
         self.assertIn(b'Beyne atildi: ? 000-Inbox/Yakala/', shown)
         self.assertEqual(len(list((self.vault / INBOX).glob('*.md'))), 1)
+
+
+class JsonTextTest(unittest.TestCase):
+    def test_encoding_names_and_fallbacks(self):
+        value = {'klasor': INBOX, 'baslik': 'Şifre ve Iğdır'}
+        readable = json.dumps(value, ensure_ascii=False, indent=2)
+        escaped = json.dumps(value, ensure_ascii=True, indent=2)
+        self.assertNotEqual(readable, escaped)
+        for name in UTF8 + ('UTF-8', 'utf_8'):
+            self.assertEqual(yakala._json_text(value, Mock(encoding=name, closed=False)), readable, name)
+        for name in ('cp1254', 'cp1252', 'cp857', 'ascii', 'latin-1', 'utf-16', 'utf-8-sig', 'no-such-codec', '', None):
+            self.assertEqual(yakala._json_text(value, Mock(encoding=name, closed=False)), escaped, name)
+        self.assertEqual(yakala._json_text(value, object()), escaped)  # a replaced stdout without the attributes
+        self.assertEqual(yakala._json_text(value, io.StringIO()), escaped)
+        stream = io.TextIOWrapper(io.BytesIO(), encoding='utf-8')
+        self.assertEqual(yakala._json_text(value, stream), readable)
+        stream.detach()  # still reports 'utf-8', but nothing can be written to it
+        self.assertEqual(yakala._json_text(value, stream), escaped)
+        self.assertEqual(yakala._json_text(value, Mock(encoding='utf-8', closed=True)), escaped)
+        # A lone surrogate (a file name the system could not decode) cannot be written as UTF-8.
+        self.assertEqual(yakala._json_text({'ad': 'x\udcff'}, Mock(encoding='utf-8', closed=False)),
+                         '{\n  "ad": "x\\udcff"\n}')
 
 
 class FakeSession:

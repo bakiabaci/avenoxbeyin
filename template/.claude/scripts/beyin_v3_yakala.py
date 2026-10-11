@@ -1747,6 +1747,27 @@ def human(result, command):
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
+def _json_text(result, stream):
+    """JSON for `stream`: readable where it already writes UTF-8, ASCII escapes everywhere else.
+
+    macOS and Linux keep the literal characters 3.9.0 printed (a Turkish title, the inbox emoji).
+    A piped Windows console is cp1254 or cp1252, where the emoji cannot be encoded at all, and
+    ASCII means the same under whatever decoder the reader uses (#268). The stream decides, not
+    the platform: its encoding name is normalized (utf-8, utf8, UTF8, cp65001), and a detached
+    or closed stream, or one without a usable name, gets ASCII.
+    """
+    import codecs
+    try:
+        # .closed raises on a detached stream, which still reports the encoding it once had.
+        if not stream.closed and codecs.lookup(stream.encoding).name == 'utf-8':
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+            text.encode('utf-8')  # a lone surrogate (an undecodable file name) still needs the escapes
+            return text
+    except (AttributeError, LookupError, TypeError, ValueError):
+        pass
+    return json.dumps(result, ensure_ascii=True, indent=2)
+
+
 def main(argv=None, vault=None, state=None):
     def shared(default):
         # Subcommands must not reset a --vault/--json given before them, hence SUPPRESS there.
@@ -1845,9 +1866,9 @@ def main(argv=None, vault=None, state=None):
     if sys.stdout is None:
         return 0
     if as_json or command == 'sablon':
-        # ASCII JSON reads the same under every code page and every decoder: a piped Windows
-        # console is cp1254/cp1252, where the inbox emoji cannot be encoded at all (#268).
-        print(json.dumps(result, ensure_ascii=True, indent=2))
+        # Keep the stream check: literal characters only for a UTF-8 stream, ASCII escapes for a
+        # legacy code page, where printing them raw fails the command after it did its work (#268).
+        print(_json_text(result, sys.stdout))
         return 0
     if hasattr(sys.stdout, 'reconfigure'):
         # Text for a person: a character the terminal cannot show prints as '?', as in beyin.py.
