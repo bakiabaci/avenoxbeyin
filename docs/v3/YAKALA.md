@@ -41,8 +41,8 @@ gösterir. Seçtiğin tuşu başka bir uygulama zaten kullanıyorsa komut uyarı
 ### Tarayıcı: Obsidian Web Clipper
 
 1. [Obsidian Web Clipper](https://obsidian.md/clipper) eklentisini kur (Chrome, Firefox, Safari, Edge, Arc, Brave).
-2. Eklentinin ayarlarında **Şablonlar > İçe aktar** ile kurulumun yazdığı
-   `📥 000-Inbox/Yakala/beyne-at-web-clipper.json` dosyasını seç.
+2. Eklentinin ayarlarında **Şablonlar > İçe aktar** ile kurulumun kart klasörüne yazdığı
+   `beyne-at-web-clipper.json` dosyasını seç (varsayılan `📥 000-Inbox/Yakala/`; tam yolu `kur` söyler).
 3. Bir sayfada eklentiye bas, "Beyne at" şablonunu seç, istersen **Neden** bölümüne bir satır yaz, ekle.
 
 Web Clipper sayfayı tarayıcının içinden okur; giriş isteyen sayfalar (Gmail, ücretli makale) da böylece yakalanır.
@@ -54,8 +54,31 @@ Web Clipper sayfayı tarayıcının içinden okur; giriş isteyen sayfalar (Gmai
    İstersen tek satır "neden" yaz, Enter. Esc vazgeçer.
 2. **İşlet.** Ajanına "yakalananları işle" de. Oturum başında bekleyen kaynak sayısı da görünür.
 
-Her yakalama `📥 000-Inbox/Yakala/` içinde bir kart olur. Aynı videoyu ya da sayfayı ikinci kez
-yakalarsan yeni kart açılmaz; yeni notun aynı karta eklenir.
+Her yakalama kart klasöründe (varsayılan `📥 000-Inbox/Yakala/`) bir kart olur. Aynı videoyu ya da
+sayfayı ikinci kez yakalarsan yeni kart açılmaz; yeni notun aynı karta eklenir.
+
+### Kartların klasörü
+
+Başlangıç klasörü `📥 000-Inbox` varsa kartlar onun altındaki `Yakala/` klasörüne yazılır. Yoksa
+vault'un en üstünde adı gelen kutusu olan tek klasör (`000-Inbox`, `00_INBOX`, `Gelen Kutusu`)
+kullanılır; birden çok aday varsa içinde zaten `Yakala/` olan seçilir, karar verilemiyorsa tahmin
+edilmez ve başlangıç yolu açılır. Nokta ile başlayan klasörler, sembolik bağlar, arşiv ve kasa türü
+adlar aday sayılmaz.
+
+Başka bir yer istiyorsan kurarken söyle:
+
+```sh
+python3 beyin.py yakala kur --klasor "Notlar/Yakala"
+```
+
+- Klasör vault'un içinde olmalı. Dışarı çıkan bir yol reddedilir ve hiçbir şey yazılmaz.
+- Web Clipper şablonu, skill, oturum bildirimi ve `durum` aynı klasörü gösterir. Klasörü
+  değiştirdiysen şablonu Web Clipper'a yeniden aktar.
+- Eski klasördeki kartlar taşınmaz. `kur` kaç kartın geride kaldığını söyler; işlenmelerini
+  istiyorsan onları yeni klasöre sen taşı.
+- Seçim bu makinenin durum klasöründe saklanır. Aynı vault'u başka bir makinede de kullanıyorsan
+  orada da aynı komutu çalıştır.
+- Kayıtlı klasör silinir ya da adı değişirse yukarıdaki kurala dönülür; `durum` kullanılan klasörü söyler.
 
 ## İşleme nasıl çalışır
 
@@ -70,7 +93,7 @@ yakalarsan yeni kart açılmaz; yeni notun aynı karta eklenir.
 | Mail | Seçili metin; tamamı için ajanın Gmail/Outlook bağlantısı |
 | PDF, metin dosyası | `pdftotext` ya da doğrudan okuma; görselleri ajan açar |
 
-Ham metin `📥 000-Inbox/Yakala/.ham/` altında durur. Nokta ile başlayan klasör olduğu için
+Ham metin kart klasörünün içinde `.ham/` altında durur. Nokta ile başlayan klasör olduğu için
 aramaya ve Obsidian'a karışmaz, `.gitignore` ile depoya da girmez.
 
 ### İsteğe bağlı araçlar
@@ -99,7 +122,7 @@ beyin.py yakala ekle URL|DOSYA|METIN [--neden "..."]
 beyin.py yakala liste [--durum bekliyor|cikarildi|islendi|hata]
 beyin.py yakala isle [ID ...] [--ses-yok] [--tekrar]
 beyin.py yakala bitti ID --bilgi knowledge/concepts/x.md [--ozet "..."]
-beyin.py yakala kur [--kisayol-yok] [--tus 'ctrl+alt+b']
+beyin.py yakala kur [--kisayol-yok] [--tus 'ctrl+alt+b'] [--klasor "Notlar/Yakala"]
 beyin.py yakala kisayol ['cmd+"']
 beyin.py yakala kaldir | durum | sablon
 ```
