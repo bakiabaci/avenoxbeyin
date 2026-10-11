@@ -424,10 +424,6 @@ def main(argv=None):
         for stream in (sys.stdout, sys.stderr):
             if hasattr(stream, 'reconfigure'):
                 stream.reconfigure(errors='replace')
-    else:
-        for stream in (sys.stdout, sys.stderr):
-            if hasattr(stream, 'reconfigure'):
-                stream.reconfigure(encoding='utf-8')
     command = argv[0] if argv else 'doctor'
     vault = Path(__file__).resolve().parent
     stamp = vault / '.beyin-version'
@@ -465,12 +461,7 @@ def main(argv=None):
             parser.add_argument('--package', type=Path)
             parser.add_argument('--metadata-only', action='store_true')
             parser.add_argument('--dismiss')
-            try:
-                args = parser.parse_args(argv)
-            except SystemExit as exc:
-                if not human:
-                    print(json.dumps({'error': 'ArgumentError', 'message': 'Invalid arguments provided.'}, ensure_ascii=False), file=sys.stdout)
-                sys.exit(exc.code)
+            args = parser.parse_args(argv)
             if args.command != 'update' and (args.check or args.package or args.metadata_only or args.dismiss is not None):
                 parser.error('update options require the update command')
             if args.metadata_only and (not args.check or args.package or args.dismiss is not None):
@@ -515,7 +506,7 @@ def main(argv=None):
         return code
     except Exception as exc:
         error = {'error': type(exc).__name__, 'message': str(exc)}
-        print(human_result(error, command, installed_version) if human else json.dumps(error, ensure_ascii=False), file=sys.stderr if human else sys.stdout)
+        print(human_result(error, command, installed_version) if human else json.dumps(error, ensure_ascii=True), file=sys.stderr)
         return 1
 
 
