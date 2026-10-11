@@ -311,7 +311,7 @@ class YakalaUnitTest(unittest.TestCase):
 
 
 class YakalaInboxTest(unittest.TestCase):
-    """Which folder holds the cards: the saved choice, the starter folder, one inbox by word, else no guess."""
+    """Which folder holds the cards: the saved choice, the one inbox already in use, the starter, one inbox by word."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='v3-yakala-inbox-')
@@ -345,24 +345,35 @@ class YakalaInboxTest(unittest.TestCase):
         self.assertEqual(chosen('00_INBOX', 'Notlar'), '00_INBOX/Yakala')
         self.assertEqual(chosen('GELEN KUTUSU'), 'GELEN KUTUSU/Yakala')
         self.assertEqual(chosen('İNBOX'), 'İNBOX/Yakala')  # str.lower() alone turns this İ into two code points
-        self.assertEqual(chosen('📥 000-Inbox', '00_INBOX'), INBOX)  # the starter folder wins
-        self.assertEqual(chosen('📥 000-Inbox', '00_INBOX/Yakala'), INBOX)  # always, so an existing vault never moves
-        self.assertEqual(chosen('00_INBOX', 'Gelen Kutusu'), INBOX)  # two inboxes: no guess
-        self.assertEqual(chosen('00_INBOX', 'Gelen Kutusu/Yakala'), 'Gelen Kutusu/Yakala')  # the one already in use
-        self.assertEqual(chosen('00_INBOX/Yakala', 'Gelen Kutusu/Yakala'), INBOX)
+        self.assertEqual(chosen('📥 000-Inbox', '00_INBOX'), INBOX)  # nothing in use yet: the starter folder wins
+        self.assertEqual(chosen('00_INBOX', 'Gelen Kutusu'), INBOX)  # two inboxes, none in use: no guess
         self.assertEqual(chosen('Gelen Belgeler', 'Inbox Arşivi', '🔐 Kasa Inbox', '.inbox', 'Inboxing'), INBOX)
+        # Cards that already exist outrank a name: the one inbox that holds Yakala/ is the one in use.
+        self.assertEqual(chosen('00_INBOX', 'Gelen Kutusu/Yakala'), 'Gelen Kutusu/Yakala')
+        self.assertEqual(chosen('📥 000-Inbox', '00_INBOX/Yakala'), '00_INBOX/Yakala')  # an emptied starter left behind
+        self.assertEqual(chosen('📥 000-Inbox/Yakala', '00_INBOX'), INBOX)
+        # Yakala/ in more than one is a tie: the starter wins when the vault has it, else no guess.
+        self.assertEqual(chosen('📥 000-Inbox/Yakala', '00_INBOX/Yakala'), INBOX)
+        self.assertEqual(chosen('📥 000-Inbox', '00_INBOX/Yakala', 'Gelen Kutusu/Yakala'), INBOX)
+        self.assertEqual(chosen('00_INBOX/Yakala', 'Gelen Kutusu/Yakala'), INBOX)
+        # A Yakala/ inside a folder that is no candidate does not count.
+        self.assertEqual(chosen('📥 000-Inbox', 'Inbox Arşivi/Yakala', '🔐 Kasa Inbox/Yakala', '.inbox/Yakala', 'Notlar/Yakala'), INBOX)
+        self.assertEqual(chosen('00_INBOX', 'Inbox Arşivi/Yakala', 'Notlar/Yakala'), '00_INBOX/Yakala')
 
     def test_linked_folder_is_never_picked_or_followed_out(self):
         outside = Path(self.tmp.name) / 'Disari'
-        outside.mkdir()
+        (outside / 'Yakala').mkdir(parents=True)  # even a link whose target already holds Yakala/
         try:
             (self.vault / 'Inbox').symlink_to(outside, target_is_directory=True)
         except OSError:
             self.skipTest('this account cannot create symlinks')
         self.assertEqual(yakala.find_inbox(self.vault, self.state), INBOX)
+        (self.vault / '📥 000-Inbox').mkdir()
+        self.assertEqual(yakala.find_inbox(self.vault, self.state), INBOX)
         with self.assertRaises(ValueError):
             yakala.install(self.vault, self.state, hotkey=False, folder_spec='Inbox/Yakala')
-        self.assertEqual((list(outside.iterdir()), self.top(), self.state.exists()), ([], ['Inbox'], False))
+        self.assertEqual((list((outside / 'Yakala').iterdir()), self.top(), self.state.exists()),
+                         ([], ['Inbox', '📥 000-Inbox'], False))
 
     def test_inbox_words_are_the_doctors(self):
         import unicodedata

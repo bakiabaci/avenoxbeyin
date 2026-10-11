@@ -103,27 +103,31 @@ def _saved_inbox(vault, state=None):
 
 
 def find_inbox(vault, state=None):
-    """Vault-relative folder that holds the cards.
+    """Vault-relative folder that holds the cards; cards that already exist outrank a name.
 
-    The folder `kur` saved wins while it exists. Otherwise the starter folder ('📥 000-Inbox')
-    when the vault has it; else the only top-level folder named like an inbox, or among several
-    the single one that already holds 'Yakala/'. Anything less certain is not guessed: the
-    starter path is used, as before. Dot folders and links are never picked.
+    The folder `kur` saved wins while it exists. Otherwise, when exactly one inbox (the starter
+    folder '📥 000-Inbox' included) already holds 'Yakala/', that one; else the starter folder
+    when the vault has it; else the only top-level folder named like an inbox. Anything less
+    certain is not guessed: the starter path is used, as before. An inbox is told by word; dot
+    folders, links, archives and kasa-class names are never picked.
     """
     vault = Path(vault)
     saved = _saved_inbox(vault, state)
     if saved:
         return saved
-    if (vault / STARTER).is_dir():
-        return DEFAULT_INBOX
+    if (vault / DEFAULT_INBOX).is_dir():
+        return DEFAULT_INBOX  # in use: alone it is the one, beside another used inbox the starter wins
     try:
         with os.scandir(vault) as entries:
             names = sorted(entry.name for entry in entries if not entry.name.startswith('.') and
                            not entry.is_symlink() and entry.is_dir() and _inbox_name(entry.name))
     except OSError:
         names = []
-    if len(names) > 1:
-        names = [name for name in names if (vault / name / CARDS).is_dir()]
+    used = [name for name in names if (vault / name / CARDS).is_dir()]
+    if len(used) == 1:
+        return used[0] + '/' + CARDS
+    if (vault / STARTER).is_dir():
+        return DEFAULT_INBOX
     return names[0] + '/' + CARDS if len(names) == 1 else DEFAULT_INBOX
 
 

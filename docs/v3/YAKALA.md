@@ -64,11 +64,11 @@ sayfayı ikinci kez yakalarsan yeni kart açılmaz; yeni notun aynı karta eklen
 
 ### Kartların klasörü
 
-Başlangıç klasörü `📥 000-Inbox` varsa kartlar onun altındaki `Yakala/` klasörüne yazılır. Yoksa
-vault'un en üstünde adı gelen kutusu olan tek klasör (`000-Inbox`, `00_INBOX`, `Gelen Kutusu`)
-kullanılır; birden çok aday varsa içinde zaten `Yakala/` olan seçilir, karar verilemiyorsa tahmin
-edilmez ve başlangıç yolu açılır. Nokta ile başlayan klasörler, sembolik bağlar, arşiv ve kasa türü
-adlar aday sayılmaz.
+Gelen kutusu klasörlerinden yalnız birinde `Yakala/` zaten varsa kartlar oraya yazılır; böyle tek
+bir klasör yoksa başlangıç klasörü `📥 000-Inbox` kullanılır, o da yoksa vault'un en üstünde adı gelen
+kutusu olan tek klasör (`000-Inbox`, `00_INBOX`, `Gelen Kutusu`). Karar verilemiyorsa tahmin edilmez
+ve başlangıç yolu açılır. Nokta ile başlayan klasörler, sembolik bağlar, arşiv ve kasa türü adlar
+gelen kutusu sayılmaz.
 
 Başka bir yer istiyorsan kurarken söyle:
 
