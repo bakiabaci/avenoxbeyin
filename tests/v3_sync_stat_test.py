@@ -3,28 +3,37 @@
 
 Every case is checked against LegacySyncEngine, the frozen engine that reads every source,
 on its own state directory over the same vault. A cache hit must give the same sync report
-and the same events, records and ownership rows as reading the bytes.
+and the same events, records and ownership rows as reading the bytes, and every indexed
+record must carry the hash of the bytes now on disk.
 
 Fixtures are written and read as bytes: text mode would turn '\n' into '\r\n' on Windows,
 and the expected texts below are LF.
 """
 from contextlib import contextmanager
 import errno
+import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
 
+from v3_package_helpers import inherited_env
 from v3_sync_test import load_module
 from v3_sync_warm_test import LegacySyncEngine
 
 subject = load_module()
 SCRIPTS = Path(subject.__file__).resolve().parent
+CLI = Path(__file__).resolve().parents[1] / 'scripts/beyin_v3.py'
 _real_time_ns = time.time_ns
+NO_CHANGE_TIME = 'Windows os.stat has no change time: st_ctime is the creation time'
 
 
 def put(path, text):
@@ -48,6 +57,12 @@ def weak_signature(st):
     return (st.st_size, st.st_mtime_ns, 0, '0')
 
 
+def tunneled_signature(st):
+    """NTFS hands the creation time of a replaced file to the file that takes its name
+    (tunneling), so there an atomic save shows only in the file id."""
+    return (st.st_size, st.st_mtime_ns, 0, str(st.st_ino))
+
+
 @contextmanager
 def clock(seconds):
     """Run a sync as if it happened `seconds` from now (no real sleeping)."""
@@ -67,6 +82,7 @@ class StatSignatureTest(unittest.TestCase):
         self.engine = subject.SyncEngine(self.vault, self.state)
         self.oracle = LegacySyncEngine(self.vault, self.root / 'oracle-state')
         self.minutes = 0
+        self.last_reads = []
 
     def write(self, name='notes/note.md', id='note', text='Alpha calibration.\n', **fields):
         return put(self.vault / name, subject.render(dict(id=id, kind='note', revision=1, **fields), text))
@@ -94,13 +110,33 @@ class StatSignatureTest(unittest.TestCase):
             yield calls
 
     def sync_both(self):
-        """One sync of each engine over the same vault; reports and tables must be equal."""
+        """One sync of each engine over the same vault; reports and tables must be equal.
+
+        self.last_reads names the sources the cached engine read (twice each: scan and validation).
+        """
         with self.later():
-            result = self.engine.sync()
+            with self.reads() as calls:
+                result = self.engine.sync()
             expected = self.oracle.sync()
+        self.last_reads = calls
         self.assertEqual(result, expected)
         self.assertEqual(self.snapshot(self.engine), self.snapshot(self.oracle))
+        self.assert_index_is_fresh()
         return result
+
+    def assert_index_is_fresh(self):
+        """Retrieval's own gate: a record is used only while its hash is that of its source."""
+        with self.engine.store._connect() as db:
+            rows = db.execute('SELECT s.source, r.payload FROM markdown_sources s JOIN records r ON r.id=s.id').fetchall()
+        for source, payload in rows:
+            # open(), not Path.read_bytes: the tests patch and count that one.
+            with open(self.vault / source, 'rb') as handle:
+                self.assertEqual(json.loads(payload)['source_sha256'], hashlib.sha256(handle.read()).hexdigest(), source)
+
+    def signatures(self):
+        """source -> (payload_sha256, seen_ns); an empty hash is a signature seen once, not trusted."""
+        with self.engine.store._connect() as db:
+            return {row[0]: row[1:] for row in db.execute('SELECT source, payload_sha256, seen_ns FROM source_signatures')}
 
     def settle(self):
         """Index the vault and make every signature trusted (read after the racy window)."""
@@ -126,9 +162,23 @@ class StatSignatureTest(unittest.TestCase):
         self.assertEqual(result['status'], 'succeeded')
         # Only the oracle read the five notes (twice each: scan and validation).
         self.assertEqual(len(calls), 10)
+        self.assertEqual(self.last_reads, [])
         with self.reads() as calls, self.later():
             self.assertEqual(self.engine.sync()['indexed'], 5)
         self.assertEqual(calls, [])
+
+    def test_a_signature_is_trusted_from_its_second_read(self):
+        # Seen once: remembered, not trusted. Read again two seconds later: trusted.
+        self.write()
+        self.sync_both()
+        (payload, seen), = self.signatures().values()
+        self.assertEqual(payload, '')
+        self.sync_both()
+        self.assertEqual(self.last_reads, ['note.md', 'note.md'])
+        (payload, again), = self.signatures().values()
+        self.assertEqual((len(payload), again), (64, seen))
+        self.sync_both()
+        self.assertEqual(self.last_reads, [])
 
     def test_a_same_size_edit_is_indexed(self):
         path = self.write()
@@ -146,7 +196,7 @@ class StatSignatureTest(unittest.TestCase):
             self.assertEqual(self.oracle.sync(), result)
         self.assertEqual(self.snapshot(self.engine), self.snapshot(self.oracle))
 
-    @unittest.skipIf(os.name == 'nt', 'Windows os.stat has no change time: st_ctime is the creation time')
+    @unittest.skipIf(os.name == 'nt', NO_CHANGE_TIME)
     def test_an_edit_with_its_mtime_put_back_is_indexed(self):
         path = self.write()
         self.settle()
@@ -360,6 +410,50 @@ class StatSignatureTest(unittest.TestCase):
     def test_signature_includes_ctime_and_file_id(self):
         st = os.stat(self.write())
         self.assertEqual(subject._stat_signature(st), (st.st_size, st.st_mtime_ns, st.st_ctime_ns, str(st.st_ino)))
+
+    def put_back(self, path, before):
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        self.assertEqual((path.stat().st_size, path.stat().st_mtime_ns), (before.st_size, before.st_mtime_ns))
+
+    def test_a_file_server_clock_behind_this_one_does_not_hide_an_edit(self):
+        # Timestamps stamped by a clock 10 s behind this machine's, in 2 s ticks: the first write
+        # already looks old enough, and the edit lands in its tick. A signature seen once is not
+        # trusted; it settles on a read two seconds of this machine's own clock later.
+        path = self.write()
+        with patch.object(subject, '_stat_signature', coarse_signature):
+            for offset, old, new in ((10, None, None), (10.5, b'Alpha', b'Omega'), (11.5, b'Omega', b'Gamma')):
+                if old:
+                    before = path.stat()
+                    self.rewrite_same_size(path, old, new)
+                    self.put_back(path, before)
+                with clock(offset):
+                    result = self.engine.sync()
+                    self.assertEqual(result, self.oracle.sync())
+                self.assertEqual(self.snapshot(self.engine), self.snapshot(self.oracle))
+                self.assert_index_is_fresh()
+            self.assertEqual(self.record('note')['text'], 'Gamma calibration.\n')
+            with clock(20):
+                self.engine.sync()
+            with self.reads() as calls, clock(30):
+                self.engine.sync()
+            self.assertEqual(calls, [])
+
+    def test_a_clock_set_back_after_a_sighting_starts_the_wait_over(self):
+        # A first sighting dated ahead of the clock cannot prove that two seconds went by.
+        self.write()
+        with clock(3600):
+            self.engine.sync()
+        (payload, seen), = self.signatures().values()
+        with clock(5):
+            self.engine.sync()
+        (payload, again), = self.signatures().values()
+        self.assertEqual(payload, '')
+        self.assertLess(again, seen)
+        with clock(10):
+            self.engine.sync()
+        with self.reads() as calls, clock(20):
+            self.engine.sync()
+        self.assertEqual(calls, [])
 
 
 def _load(name):

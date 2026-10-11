@@ -301,10 +301,15 @@ def _has_conflict_markers(text):
 # Warm syncs skip reading a source whose bytes were already indexed (#233). The signature is
 # size, mtime, ctime and file id: on POSIX ctime moves with every content or utime change, on
 # Windows st_ctime is the creation time and st_ino the file index, so an atomic save (a new
-# file) changes both. As in git's racy-clean rule, a signature is only recorded when the read
-# came RACY_WINDOW_NS after the source last changed: FAT keeps 2 s timestamps, HFS+ and some
-# cloud drives 1 s, so a second write in the same tick could keep the signature.
-SIGNATURE_SCHEMA = 'source-signatures/1'
+# file) changes both. FAT and exFAT have no change time (st_ctime follows mtime there) and
+# FAT keeps 2 s timestamps, HFS+ and some cloud drives 1 s: a second write in the same tick
+# can leave the whole signature as it was. So, as in git's racy-clean rule, a signature is trusted
+# only for bytes read RACY_WINDOW_NS after the source last changed, and that is established
+# twice: by the file's own timestamps against this machine's clock, and by a second read of
+# the same signature RACY_WINDOW_NS after it was first seen. The second proof compares this
+# clock only with itself, so it also holds where another clock stamps the files (a file
+# server, a VM shared folder) and runs behind this one.
+SIGNATURE_SCHEMA = 'source-signatures/2'
 RACY_WINDOW_NS = 2_000_000_000
 
 
@@ -330,9 +335,14 @@ class _SignatureCache:
     markdown_sources still assigns the id to this source, and the payload is byte for byte
     the one written (or confirmed) from that read. The payload hash also catches any other
     writer of the row, e.g. a rolled back version without this table re-indexing the source.
+
+    A row with an empty payload_sha256 is a signature seen once (at seen_ns): it is never a
+    hit, it only lets a later read of the same signature settle it. Rows of sources the walk
+    did not reach (deleted, renamed, in a directory that became excluded) are removed, so a
+    source that comes back is read.
     """
 
-    COLUMNS = 'source, id, size, mtime_ns, ctime_ns, ino, payload_sha256'
+    COLUMNS = 'source, id, size, mtime_ns, ctime_ns, ino, payload_sha256, seen_ns'
 
     def __init__(self, db, sources, payloads):
         self.db, self.sources, self.payloads = db, sources, payloads
@@ -353,7 +363,8 @@ class _SignatureCache:
         # New or unknown code, or no table yet: no stored signature is trusted.
         db.execute('DROP TABLE IF EXISTS source_signatures')
         db.execute('CREATE TABLE source_signatures(source TEXT PRIMARY KEY, id TEXT NOT NULL, size INTEGER NOT NULL, '
-                   'mtime_ns INTEGER NOT NULL, ctime_ns INTEGER NOT NULL, ino TEXT NOT NULL, payload_sha256 TEXT NOT NULL)')
+                   'mtime_ns INTEGER NOT NULL, ctime_ns INTEGER NOT NULL, ino TEXT NOT NULL, payload_sha256 TEXT NOT NULL, '
+                   'seen_ns INTEGER NOT NULL)')
         if epoch is None:
             db.execute("DELETE FROM metadata WHERE key='source_signature_epoch'")
         else:
@@ -362,7 +373,7 @@ class _SignatureCache:
     def lookup(self, relative, st):
         """The indexed id when the source need not be read, else None."""
         row = self.rows.get(relative)
-        if row is None or row[1:5] != _stat_signature(st):
+        if row is None or not row[5] or row[1:5] != _stat_signature(st):
             return None
         id, payload = row[0], self.payloads.get(row[0])
         if payload is None or self.sources.get(id) != relative or _hash(payload) != row[5]:
@@ -371,9 +382,17 @@ class _SignatureCache:
         return id
 
     def read(self, relative, st, id):
-        # A read within the racy window records nothing: the source is read again next time.
-        if self.enabled and max(st.st_mtime_ns, st.st_ctime_ns) < self.started - RACY_WINDOW_NS:
-            self.pending[relative] = (id, _stat_signature(st))
+        """Note a source that was just read into a record; `st` was taken before its bytes."""
+        if not self.enabled:
+            return
+        signature, now, row = _stat_signature(st), time.time_ns(), self.rows.get(relative)
+        # When this signature was first seen. A time ahead of the clock (it was set back) starts over.
+        seen = row[6] if row is not None and row[1:5] == signature and row[6] <= now else now
+        # Settled: both proofs put this read RACY_WINDOW_NS after the last change. Otherwise the
+        # row only remembers the sighting and the source is read again next time.
+        settled = (seen <= self.started - RACY_WINDOW_NS
+                   and max(st.st_mtime_ns, st.st_ctime_ns) < self.started - RACY_WINDOW_NS)
+        self.pending[relative] = (id, signature, seen, settled)
 
     def save(self, indexed):
         """Record a signature for each read source whose payload is now indexed and owned by it.
@@ -381,9 +400,9 @@ class _SignatureCache:
         One statement per kind of change, so the SQL of a sync does not grow with the vault.
         """
         rows = dict(self.kept)
-        for source, (id, signature) in self.pending.items():
+        for source, (id, signature, seen, settled) in self.pending.items():
             if id in indexed:
-                rows[source] = (id, *signature, _hash(indexed[id]))
+                rows[source] = (id, *signature, _hash(indexed[id]) if settled else '', seen)
         stale = sorted(self.rows.keys() - rows.keys())
         changed = [[source, *row] for source, row in sorted(rows.items()) if self.rows.get(source) != row]
         try:
@@ -392,12 +411,12 @@ class _SignatureCache:
                                 (json.dumps(stale),))
             if changed:
                 self.db.execute(f'INSERT OR REPLACE INTO source_signatures({self.COLUMNS}) SELECT '
-                                + ', '.join(f"json_extract(value, '$[{index}]')" for index in range(7))
+                                + ', '.join(f"json_extract(value, '$[{index}]')" for index in range(8))
                                 + ' FROM json_each(?)', (json.dumps(changed, ensure_ascii=False),))
         except sqlite3.OperationalError:
             # SQLite built without JSON functions.
             self.db.executemany('DELETE FROM source_signatures WHERE source=?', [(source,) for source in stale])
-            self.db.executemany(f'INSERT OR REPLACE INTO source_signatures({self.COLUMNS}) VALUES (?,?,?,?,?,?,?)', changed)
+            self.db.executemany(f'INSERT OR REPLACE INTO source_signatures({self.COLUMNS}) VALUES (?,?,?,?,?,?,?,?)', changed)
 
 
 class SyncEngine:
