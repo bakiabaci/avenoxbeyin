@@ -1642,20 +1642,6 @@ def human(result, command):
 
 
 def main(argv=None, vault=None, state=None):
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, 'reconfigure'):
-            try:
-                stream.reconfigure(encoding='utf-8', errors='replace')
-            except Exception:
-                try:
-                    stream.reconfigure(errors='replace')
-                except Exception:
-                    pass
-    if hasattr(sys.stdin, 'reconfigure'):
-        try:
-            sys.stdin.reconfigure(encoding='utf-8', errors='replace')
-        except Exception:
-            pass
     def shared(default):
         # Subcommands must not reset a --vault/--json given before them, hence SUPPRESS there.
         common = argparse.ArgumentParser(add_help=False)
@@ -1753,20 +1739,19 @@ def main(argv=None, vault=None, state=None):
         result = clipper_template()
     if sys.stdout is None:
         return 0
-    print(json.dumps(result, ensure_ascii=False, indent=2) if as_json or command == 'sablon' else human(result, command))
+    if as_json or command == 'sablon':
+        # ASCII JSON reads the same under every code page and every decoder: a piped Windows
+        # console is cp1254/cp1252, where the inbox emoji cannot be encoded at all (#268).
+        print(json.dumps(result, ensure_ascii=True, indent=2))
+        return 0
+    if hasattr(sys.stdout, 'reconfigure'):
+        # Text for a person: a character the terminal cannot show prints as '?', as in beyin.py.
+        sys.stdout.reconfigure(errors='replace')
+    print(human(result, command))
     return 0
 
 
 if __name__ == '__main__':
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, 'reconfigure'):
-            try:
-                stream.reconfigure(encoding='utf-8', errors='replace')
-            except Exception:
-                try:
-                    stream.reconfigure(errors='replace')
-                except Exception:
-                    pass
     try:
         raise SystemExit(main())
     except ValueError as exc:
