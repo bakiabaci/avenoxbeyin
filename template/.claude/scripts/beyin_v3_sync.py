@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import tempfile
 import sys
 import time
@@ -28,6 +29,18 @@ def _hash(data):
     return hashlib.sha256(data if isinstance(data, bytes) else data.encode()).hexdigest()
 
 
+def _read_only(path):
+    """True only for a file that carries the Windows read-only attribute.
+
+    Read from the file's own attributes: os.access also answers False for a target it cannot
+    query at all, such as one pending deletion, and that one is worth a retry.
+    """
+    try:
+        return bool(os.stat(path).st_file_attributes & stat.FILE_ATTRIBUTE_READONLY)
+    except (OSError, AttributeError):
+        return False
+
+
 def _safe_replace(source, destination):
     """os.replace, retried briefly only for a Windows sharing violation.
 
@@ -43,7 +56,7 @@ def _safe_replace(source, destination):
             return
         except PermissionError as exc:
             if (attempt == attempts - 1 or getattr(exc, 'winerror', None) not in (5, 32, 33)
-                    or (os.path.exists(destination) and not os.access(destination, os.W_OK))):
+                    or _read_only(destination)):
                 raise
             time.sleep(0.015 * (2 ** attempt))
 

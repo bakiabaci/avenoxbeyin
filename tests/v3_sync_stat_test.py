@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -943,39 +944,62 @@ class SafeReplaceTest(unittest.TestCase):
     def test_windows_read_only_target_is_raised_at_once(self):
         # #230: Windows refuses to replace a read-only file with the same WinError 5 a scanner
         # causes. No wait lifts that flag, so the caller gets the error without 225 ms of retries.
+        for name in self.modules:
+            with self.subTest(module=name):
+                module = subject if name == 'beyin_v3_sync' else _load(name)
+                calls = []
+
+                def denied(source, destination):
+                    calls.append(destination)
+                    error = PermissionError(errno.EACCES, 'Access is denied', str(destination))
+                    error.winerror = 5
+                    raise error
+
+                with patch.object(module.os, 'name', 'nt'), patch.object(module.os, 'replace', denied), \
+                        patch.object(module.time, 'sleep') as sleep:
+                    with patch.object(module, '_read_only', return_value=True):
+                        with self.assertRaises(PermissionError):
+                            module._safe_replace('a', 'b')
+                    self.assertEqual((len(calls), sleep.call_count), (1, 0))
+                    # Not read-only and still denied: a scanner, an open handle, a target
+                    # pending deletion. Worth the retries.
+                    calls.clear()
+                    with patch.object(module, '_read_only', return_value=False):
+                        with self.assertRaises(PermissionError):
+                            module._safe_replace('a', 'b')
+                    self.assertEqual((len(calls), sleep.call_count), (5, 4))
+
+    def test_read_only_is_the_file_attribute(self):
         with tempfile.TemporaryDirectory(prefix='beyin-safe-replace-') as directory:
-            # Plain strings, made before os.name is faked: pathlib refuses a WindowsPath elsewhere.
-            target, missing = os.path.join(directory, 'locked.md'), os.path.join(directory, 'new.md')
-            Path(target).write_bytes(b'locked')
+            target = Path(directory) / 'locked.md'
+            target.write_bytes(b'locked')
             for name in self.modules:
                 with self.subTest(module=name):
                     module = subject if name == 'beyin_v3_sync' else _load(name)
-                    calls = []
+                    self.assertFalse(module._read_only(target))
+                    self.assertFalse(module._read_only(Path(directory) / 'missing.md'))
+                    target.chmod(stat.S_IREAD)
+                    try:
+                        # POSIX has no such attribute, and never retries a replace anyway.
+                        self.assertEqual(module._read_only(target), os.name == 'nt')
+                    finally:
+                        target.chmod(stat.S_IREAD | stat.S_IWRITE)
 
-                    def denied(source, destination):
-                        calls.append(destination)
-                        error = PermissionError(errno.EACCES, 'Access is denied', str(destination))
-                        error.winerror = 5
-                        raise error
-
-                    with patch.object(module.os, 'name', 'nt'), patch.object(module.os, 'replace', denied), \
-                            patch.object(module.time, 'sleep') as sleep:
-                        with patch.object(module.os, 'access', return_value=False):
-                            with self.assertRaises(PermissionError):
-                                module._safe_replace('a', target)
-                        self.assertEqual((len(calls), sleep.call_count), (1, 0))
-                        # Writable and still denied: a scanner or an open handle, worth the retries.
-                        calls.clear()
-                        with patch.object(module.os, 'access', return_value=True):
-                            with self.assertRaises(PermissionError):
-                                module._safe_replace('a', target)
-                        self.assertEqual((len(calls), sleep.call_count), (5, 4))
-                        # A target that does not exist yet cannot be read-only.
-                        calls.clear()
-                        with patch.object(module.os, 'access', return_value=False):
-                            with self.assertRaises(PermissionError):
-                                module._safe_replace('a', missing)
-                        self.assertEqual(len(calls), 5)
+    @unittest.skipUnless(os.name == 'nt', 'only Windows refuses to replace a read-only file')
+    def test_a_real_read_only_target_fails_without_waiting(self):
+        with tempfile.TemporaryDirectory(prefix='beyin-safe-replace-') as directory:
+            source, target = Path(directory) / 'new.md', Path(directory) / 'locked.md'
+            source.write_bytes(b'new')
+            target.write_bytes(b'locked')
+            target.chmod(stat.S_IREAD)
+            try:
+                with patch.object(subject.time, 'sleep') as sleep:
+                    with self.assertRaises(PermissionError):
+                        subject._safe_replace(source, target)
+                sleep.assert_not_called()
+                self.assertEqual(target.read_bytes(), b'locked')
+            finally:
+                target.chmod(stat.S_IREAD | stat.S_IWRITE)
 
 
 if __name__ == '__main__':
