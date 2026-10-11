@@ -17,11 +17,13 @@ import subprocess
 import sys
 import tempfile
 import unicodedata
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 sys.dont_write_bytecode = True
 
-INBOX = '📥 000-Inbox/Yakala'
+DEFAULT_INBOX = '📥 000-Inbox/Yakala'
+INBOX = DEFAULT_INBOX
+STARTER, CARDS = DEFAULT_INBOX.split('/')
 RAW = '.ham'
 FILES = 'dosyalar'
 STATE_FILE = 'yakala.json'
@@ -35,8 +37,102 @@ NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
 # ---------------------------------------------------------------- cards
 
-def inbox(vault):
-    return Path(vault) / INBOX
+# The doctor's inbox report tells an inbox folder by these words on a folded name
+# (beyin_v3_hygiene: INBOX_WORDS, SENSITIVE_WORDS, fold). Copied, not imported: the hotkey
+# listener runs this file alone from the state folder. A test keeps the copies equal.
+INBOX_WORDS = re.compile(r'(?:inbox|inboxes|gelenkutusu|gelenkutum)')
+SENSITIVE_WORDS = re.compile(
+    r'(?:kasa|sifre|parola|kimlik|kimlig|finans|finansal|musteri|vergi|fatura|maas|ozel|gizli|gizlilik)'
+    r'(?:ler|lar)?(?:i|im|in|imiz|leri|lari)?'
+    r'|(?:private|secret|password|credential)s?')
+ARCHIVE_WORDS = re.compile(r'(?:arsiv|archive)\w*')  # any suffix: "Inbox Arşivi", "Archived"
+_TR_FOLD = str.maketrans({'ş': 's', 'ğ': 'g', 'ü': 'u', 'ö': 'o', 'ç': 'c', 'ı': 'i', 'â': 'a', 'î': 'i', 'û': 'u'})
+
+
+def _name_words(name):
+    """Letter-only words of a name after NFC, Turkish İ/ı and ASCII folding ('GELEN KUTUSU', NFD 'Arşiv')."""
+    text = unicodedata.normalize('NFC', str(name)).replace('İ', 'i').replace('I', 'i').lower()
+    return re.findall(r'[^\W\d_]+', unicodedata.normalize('NFC', text.replace('\u0307', '')).translate(_TR_FOLD))
+
+
+def _inbox_name(name):
+    """An inbox by word ('000-Inbox', '00_INBOX', 'Gelen Kutusu'); never an archive or a kasa-class folder."""
+    words = _name_words(name)
+    if any(SENSITIVE_WORDS.fullmatch(word) or ARCHIVE_WORDS.fullmatch(word) for word in words):
+        return False
+    return any(INBOX_WORDS.fullmatch(word) for word in words) or any(
+        pair in (('gelen', 'kutusu'), ('gelen', 'kutum')) for pair in zip(words, words[1:]))
+
+
+def chosen_inbox(vault, spec):
+    """A folder the user named (`kur --klasor`) as a vault-relative path; ValueError unless it stays inside the vault.
+
+    Resolved first, so '..', an absolute path and a link that leaves the vault are all caught
+    before anything is created.
+    """
+    vault = Path(vault).resolve()
+    text = str(spec or '').strip().replace('\\', '/')
+    target = (vault / text).resolve() if text else vault
+    if target == vault or vault not in target.parents:
+        raise ValueError('Klasor vault\'un icinde olmali: ' + str(spec))
+    relative = target.relative_to(vault)
+    if any(part.startswith('.') for part in relative.parts):
+        raise ValueError('Nokta ile baslayan klasor secilemez (Obsidian gostermez): ' + str(spec))
+    if target.exists() and not target.is_dir():
+        raise ValueError('Bu bir klasor degil: ' + str(spec))
+    return relative.as_posix()
+
+
+def _same_folder(first, second):
+    try:
+        return first == second or os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
+def _saved_inbox(vault, state=None):
+    """The folder `kur` wrote to yakala.json, while it is still a folder inside the vault."""
+    try:
+        saved = json.loads(_state_path(state or resolve_state(vault)).read_text(encoding='utf-8')).get('klasor')
+        if saved and isinstance(saved, str):
+            relative = chosen_inbox(vault, saved)
+            return relative if (Path(vault) / relative).is_dir() else None
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
+
+
+def find_inbox(vault, state=None):
+    """Vault-relative folder that holds the cards; cards that already exist outrank a name.
+
+    The folder `kur` saved wins while it exists. Otherwise, when exactly one inbox (the starter
+    folder '📥 000-Inbox' included) already holds 'Yakala/', that one; else the starter folder
+    when the vault has it; else the only top-level folder named like an inbox. Anything less
+    certain is not guessed: the starter path is used, as before. An inbox is told by word; dot
+    folders, links, archives and kasa-class names are never picked.
+    """
+    vault = Path(vault)
+    saved = _saved_inbox(vault, state)
+    if saved:
+        return saved
+    if (vault / DEFAULT_INBOX).is_dir():
+        return DEFAULT_INBOX  # in use: alone it is the one, beside another used inbox the starter wins
+    try:
+        with os.scandir(vault) as entries:
+            names = sorted(entry.name for entry in entries if not entry.name.startswith('.') and
+                           not entry.is_symlink() and entry.is_dir() and _inbox_name(entry.name))
+    except OSError:
+        names = []
+    used = [name for name in names if (vault / name / CARDS).is_dir()]
+    if len(used) == 1:
+        return used[0] + '/' + CARDS
+    if (vault / STARTER).is_dir():
+        return DEFAULT_INBOX
+    return names[0] + '/' + CARDS if len(names) == 1 else DEFAULT_INBOX
+
+
+def inbox(vault, state=None):
+    return Path(vault) / find_inbox(vault, state)
 
 
 def now():
@@ -132,8 +228,8 @@ def write_card(path, meta, body):
     os.replace(temp, path)
 
 
-def cards(vault):
-    folder = inbox(vault)
+def cards(vault, state=None, folder=None):
+    folder = Path(folder) if folder else inbox(vault, state)
     if not folder.is_dir():
         return []
     found = []
@@ -147,16 +243,16 @@ def cards(vault):
     return found
 
 
-def find_card(vault, card_id):
-    for card in cards(vault):
+def find_card(vault, card_id, state=None):
+    for card in cards(vault, state):
         if card['id'] == card_id or card['path'].name == card_id:
             return card
     raise ValueError('Kart bulunamadi: ' + str(card_id))
 
 
-def pending(vault):
+def pending(vault, state=None):
     """Cheap for SessionStart: one directory listing, a 600-byte head read per card."""
-    folder = inbox(vault)
+    folder = inbox(vault, state)
     count = 0
     try:
         entries = list(os.scandir(folder))
@@ -174,6 +270,18 @@ def pending(vault):
     return count
 
 
+def _local_only(folder):
+    """Raw text and captured files stay out of a versioned vault, whichever folder holds the cards."""
+    folder.mkdir(parents=True, exist_ok=True)
+    ignore = folder / '.gitignore'
+    if not ignore.exists():
+        try:
+            ignore.write_text('*\n', encoding='utf-8', newline='\n')
+        except OSError:
+            pass
+    return folder
+
+
 def _unique(path):
     path = Path(path)
     if not path.exists():
@@ -185,7 +293,7 @@ def _unique(path):
     raise ValueError('Ayni adla cok fazla dosya var: ' + path.name)
 
 
-def capture(vault, url=None, text=None, files=(), why='', app=None, title=None, tool='masaustu'):
+def capture(vault, url=None, text=None, files=(), why='', app=None, title=None, tool='masaustu', state=None):
     """Write one card; a repeated URL only gains the new reason. No network."""
     vault = Path(vault)
     url = (url or '').strip() or None
@@ -194,12 +302,12 @@ def capture(vault, url=None, text=None, files=(), why='', app=None, title=None, 
     files = [Path(f).expanduser() for f in files]
     if not (url or text or files):
         raise ValueError('Yakalanacak bir sey yok: URL, metin ya da dosya ver.')
-    folder = inbox(vault)
+    folder = inbox(vault, state)
     folder.mkdir(parents=True, exist_ok=True)
     stamp = now()
     if url:
         key = canonical(url)
-        for card in cards(vault):
+        for card in cards(vault, folder=folder):
             if card['meta'].get('url') and canonical(card['meta']['url']) == key:
                 body = card['body'].rstrip()
                 addition = '\n\n## Yeniden yakalandi (' + stamp.strftime('%Y-%m-%d %H:%M') + ')\n' + (why or '_(not yok)_')
@@ -214,8 +322,7 @@ def capture(vault, url=None, text=None, files=(), why='', app=None, title=None, 
     for source in files:
         if not source.is_file():
             raise ValueError('Dosya bulunamadi: ' + str(source))
-        target = _unique(folder / FILES / source.name)
-        target.parent.mkdir(parents=True, exist_ok=True)
+        target = _unique(_local_only(folder / FILES) / source.name)
         shutil.copy2(source, target)
         copied.append(target.relative_to(vault).as_posix())
     name = stamp.strftime('%Y-%m-%d-%H%M') + '-' + (url_slug(url) if url and title == url else slug(title))
@@ -480,11 +587,11 @@ def extract(vault, card, found, allow_audio=True, info=None):
     return _section(body, 'Secim') or None, 'metin', None
 
 
-def process(vault, card_ids=None, allow_audio=True, retry=False):
+def process(vault, card_ids=None, allow_audio=True, retry=False, state=None):
     vault = Path(vault)
     found = tools()
-    targets = [find_card(vault, cid) for cid in card_ids] if card_ids else \
-        [c for c in cards(vault) if c['meta'].get('durum') == 'bekliyor' or (retry and c['meta'].get('durum') == 'hata')]
+    targets = [find_card(vault, cid, state) for cid in card_ids] if card_ids else \
+        [c for c in cards(vault, state) if c['meta'].get('durum') == 'bekliyor' or (retry and c['meta'].get('durum') == 'hata')]
     results = []
     for card in targets:
         meta, body = dict(card['meta']), card['body']
@@ -502,8 +609,7 @@ def process(vault, card_ids=None, allow_audio=True, retry=False):
         meta.update({target: info[source] for source, target in (('author', 'yazar'), ('published', 'yayin'), ('site', 'site'))
                      if info.get(source)})
         if text:
-            raw = inbox(vault) / RAW / (card['id'] + '.md')
-            raw.parent.mkdir(parents=True, exist_ok=True)
+            raw = _local_only(card['path'].parent / RAW) / (card['id'] + '.md')
             header = ['---', 'tur: yakala-ham', 'kart: ' + json.dumps(entry['kart'], ensure_ascii=False),
                       'baslik: ' + json.dumps(meta.get('baslik') or '', ensure_ascii=False),
                       'url: ' + json.dumps(meta.get('url') or '', ensure_ascii=False),
@@ -530,9 +636,9 @@ def process(vault, card_ids=None, allow_audio=True, retry=False):
             'araclar': {name: bool(path) for name, path in found.items()}}
 
 
-def finish(vault, card_id, sources=(), summary=None):
+def finish(vault, card_id, sources=(), summary=None, state=None):
     vault = Path(vault)
-    card = find_card(vault, card_id)
+    card = find_card(vault, card_id, state)
     meta, body = dict(card['meta']), card['body'].rstrip()
     links = []
     for source in sources:
@@ -546,9 +652,9 @@ def finish(vault, card_id, sources=(), summary=None):
     return {'status': 'islendi', 'id': card['id'], 'bilgi': sources}
 
 
-def listing(vault, status=None):
+def listing(vault, status=None, state=None):
     rows = []
-    for card in cards(vault):
+    for card in cards(vault, state):
         meta = card['meta']
         if status and meta.get('durum') != status:
             continue
@@ -557,11 +663,12 @@ def listing(vault, status=None):
     return {'status': 'tamam', 'kartlar': rows, 'bekleyen': sum(1 for r in rows if r['durum'] == 'bekliyor')}
 
 
-def session_notice(vault):
-    count = pending(vault)
+def session_notice(vault, state=None):
+    count = pending(vault, state)
     if not count:
         return ''
-    return ('Yakalanan ' + str(count) + ' kaynak bekliyor (' + INBOX + '). Kullanici isterse beyin-yakala skill\'iyle isle; '
+    folder = find_inbox(vault, state)
+    return ('Yakalanan ' + str(count) + ' kaynak bekliyor (' + folder + '). Kullanici isterse beyin-yakala skill\'iyle isle; '
             'kendiliginden baslama.\n')
 
 
@@ -657,9 +764,58 @@ def windows_context():
         return {}
 
 
+def _try(command, timeout=5):
+    """(returncode, stdout); (None, '') when the tool is missing or hangs."""
+    try:
+        code, out, _ = _run(command, timeout)
+        return code, out
+    except (OSError, subprocess.TimeoutExpired):
+        return None, ''
+
+
+def _linux_clipboard():
+    """Clipboard text through one helper: wl-paste on Wayland (the reader the window uses), else xclip or xsel."""
+    text = _wl_paste()
+    if text is None:
+        for name, options in (('xclip', ['-o', '-selection', 'clipboard']), ('xsel', ['-ob'])):
+            tool = _which(name)
+            if tool:
+                text = _tool_text([tool] + options)
+                break
+    return repair_mojibake(text or '')
+
+
+def _file_uri_path(line):
+    """Path of a local file:// URI; None for other text and for a URI that names another machine."""
+    match = re.fullmatch(r'file://(?:localhost)?(/.*)', line)
+    return unquote(match.group(1)) if match else None
+
+
+def linux_context():
+    """The clipboard is the only portable source on Linux: a link, copied files or plain text.
+
+    Read like the window reads it on macOS and Windows: only a clipboard that is one link is a
+    link. A link followed by more lines is text, so nothing after the first line is dropped.
+    """
+    text = _linux_clipboard().strip()
+    if not text:
+        return {}
+    if re.fullmatch(r'https?://\S+', text):
+        return {'url': text}
+    # File managers copy files as a text/uri-list: one file:// URI per line, '#' lines are comments.
+    lines = [line.strip() for line in text.splitlines()]
+    paths = [_file_uri_path(line) for line in lines if line and not line.startswith('#')]
+    if paths and all(paths):
+        paths = [path for path in paths if Path(path).is_file()]
+        return {'dosyalar': paths[:20]} if paths else {}
+    return {'metin': text}
+
+
 def gather_context():
     if sys.platform == 'darwin':
         return mac_context()
+    if sys.platform.startswith('linux'):
+        return linux_context()
     if os.name == 'nt':
         return windows_context()
     return {}
@@ -751,7 +907,42 @@ def repair_mojibake(text):
     return text
 
 
+CLIP_LIMIT = 1_000_000  # bytes taken from a clipboard helper: a card is a note, not a file transfer
+CLIP_TIMEOUT = 2  # seconds: the window must not wait on a clipboard owner that never answers
+CLIP_CUT = '\n\n[Pano metni 1 MB sınırında kesildi.]'
+
+
+def _tool_text(command):
+    """Text printed by a clipboard helper; '' when it fails, is missing or hangs. Never raises.
+
+    The bytes are decoded as UTF-8 here. With `text=True` a Latin-5 locale garbles Turkish and
+    one stray byte raises UnicodeDecodeError, which closes the window before it opens.
+    """
+    try:
+        result = subprocess.run(command, capture_output=True, timeout=CLIP_TIMEOUT, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return ''
+    if result.returncode != 0:
+        return ''
+    text = result.stdout[:CLIP_LIMIT].decode('utf-8', 'replace')
+    return text.rstrip('\ufffd') + CLIP_CUT if len(result.stdout) > CLIP_LIMIT else text
+
+
+def _wl_paste():
+    """Wayland clipboard as text; None when this is not a Wayland session or wl-clipboard is missing.
+
+    Tk runs through XWayland and can fail there with "CLIPBOARD selection doesn't exist" (#278).
+    `--type text` matters: without it wl-paste hands over whatever is offered, image bytes
+    included. Nothing copied, or only an image, is a non-zero exit and reads as ''.
+    """
+    tool = _which('wl-paste') if os.environ.get('WAYLAND_DISPLAY') else None
+    return _tool_text([tool, '--no-newline', '--type', 'text']) if tool else None
+
+
 def _clipboard(root):
+    value = _wl_paste()
+    if value:
+        return repair_mojibake(value)
     try:
         value = root.clipboard_get()
     except Exception:
@@ -759,21 +950,21 @@ def _clipboard(root):
     return repair_mojibake(value) if isinstance(value, str) else ''
 
 
-def _hotkey_hint(vault):
+def _hotkey_hint(vault, state=None):
     try:
-        label = json.loads(_state_path(resolve_state(Path(vault))).read_text(encoding='utf-8')).get('kisayol')
+        label = json.loads(_state_path(state or resolve_state(Path(vault))).read_text(encoding='utf-8')).get('kisayol')
     except (OSError, ValueError, AttributeError):
         label = None
     return (label + ' ile her yerden açılır') if label else 'İkinci beynine kaydedilir'
 
 
-def popup(vault, context=None):
+def popup(vault, context=None, state=None):
     """Command-palette window: what will be saved, one line for why, Enter saves, Esc closes."""
     context = dict(context or {})
     try:
         import tkinter as tk
     except ImportError:
-        return _popup_fallback(vault, context)
+        return _popup_fallback(vault, context, state)
     snapshot = os.environ.get('BEYIN_YAKALA_SNAPSHOT')
     root = tk.Tk()
     root.withdraw()
@@ -893,7 +1084,7 @@ def popup(vault, context=None):
     y += 8
     footer_y = y + 14
     status = canvas.create_text(pad, footer_y, anchor='w', fill=P['muted'], font=_font(12),
-                                text='Tab: panoyu ekle' if clip_text and (url or files) else _hotkey_hint(vault))
+                                text='Tab: panoyu ekle' if clip_text and (url or files) else _hotkey_hint(vault, state))
     right = W - pad
 
     def keycap(x_right, key, label):
@@ -934,7 +1125,7 @@ def popup(vault, context=None):
             text, why = why, ''  # only a typed line: the line itself is the note
         try:
             result.update(capture(vault, url=url, text=text, files=files, why=why, app=context.get('uygulama'),
-                                  title=context.get('baslik') if url else None))
+                                  title=context.get('baslik') if url else None, state=state))
         except Exception as exc:
             canvas.itemconfigure(status, text=_fit(canvas, 'Kaydedilemedi: ' + str(exc), _font(12), 300), fill=P['accent'])
             return 'break'
@@ -984,16 +1175,56 @@ def popup(vault, context=None):
     return result or {'status': 'vazgecildi'}
 
 
-def _popup_fallback(vault, context):
+LINUX_NO_WINDOW = ('Pencere acilamiyor: bu Python\'da tkinter yok, kdialog ya da zenity de kurulu degil. Birini kur '
+                   '(Arch: sudo pacman -S tk, Debian/Ubuntu: sudo apt install python3-tk) ya da beyin.py yakala ekle kullan.')
+
+
+def _linux_window():
+    """What can show the window here: 'tkinter', the path of kdialog or zenity, or None."""
+    try:
+        import tkinter  # noqa: F401
+        return 'tkinter'
+    except ImportError:
+        return _which('kdialog', 'zenity')
+
+
+def _linux_ask(shown=''):
+    """Reason typed in kdialog or zenity; None when cancelled. Neither tool: an error, nothing is saved unseen.
+
+    `shown` comes from the clipboard. It is never an argument of its own and never the start of one:
+    it follows the fixed question inside the value of --inputbox / --text. That fixed first line also
+    keeps Qt from reading the label as rich text. Both tools expand backslash escapes, and zenity
+    drops a single underscore as a mnemonic (--entry has no Pango markup), hence the doubling.
+    """
+    shown = re.sub(r'[\x00-\x1f\x7f]+', ' ', str(shown)).strip()[:120].replace('\\', '\\\\')
+    kdialog, zenity = _which('kdialog'), _which('zenity')
+    if kdialog:
+        command = [kdialog, '--title', 'Beyne at', '--inputbox', 'Neden kaydediyorsun?' + ('\n' + shown if shown else ''), '']
+    elif zenity:
+        command = [zenity, '--entry', '--title', 'Beyne at', '--text',
+                   'Neden kaydediyorsun?' + ('\n' + shown.replace('_', '__') if shown else '')]
+    else:
+        raise ValueError(LINUX_NO_WINDOW)
+    code, out = _try(command, timeout=300)
+    return out.strip() if code == 0 else None
+
+
+def _popup_fallback(vault, context, state=None):
     """No tkinter (some Homebrew/Linux Pythons): the OS dialog asks only for the reason."""
     why = ''
+    url, files, text = context.get('url'), context.get('dosyalar') or [], context.get('metin') or ''
     if sys.platform == 'darwin':
         why = _osascript('text returned of (display dialog "Neden kaydediyorsun?" default answer "" with title "Beyne at")', timeout=300) or ''
-    url = context.get('url')
-    if not (url or context.get('dosyalar') or why):
+    elif sys.platform.startswith('linux'):
+        why = _linux_ask(url or ', '.join(Path(f).name for f in files) or text)
+        if why is None:
+            return {'status': 'vazgecildi'}
+    if not (url or files or text or why):
         return {'status': 'vazgecildi'}
-    return capture(vault, url=url, text=None if url or context.get('dosyalar') else why, files=context.get('dosyalar') or [],
-                   why=why if url or context.get('dosyalar') else '', app=context.get('uygulama'), title=context.get('baslik'))
+    if text and not (url or files):  # clipboard text is the content; the dialog answer is the reason
+        return capture(vault, text=text, why=why, app=context.get('uygulama'), title=context.get('baslik'), state=state)
+    return capture(vault, url=url, text=None if url or files else why, files=files,
+                   why=why if url or files else '', app=context.get('uygulama'), title=context.get('baslik'), state=state)
 
 
 # ---------------------------------------------------------------- hotkey spec
@@ -1115,6 +1346,30 @@ def windows_hotkey(spec):
     return value, '+'.join([m.capitalize() for m in mods] + [key.upper()])
 
 
+QT_MODS = {'ctrl': 0x04000000, 'alt': 0x08000000, 'shift': 0x02000000, 'cmd': 0x10000000}
+KDE_MODS = {'ctrl': 'Ctrl', 'alt': 'Alt', 'shift': 'Shift', 'cmd': 'Meta'}
+GNOME_MODS = {'ctrl': '<Control>', 'alt': '<Alt>', 'shift': '<Shift>', 'cmd': '<Super>'}
+
+
+def linux_hotkey(spec):
+    """-> (KDE text, Qt key int, GNOME accelerator, label); letter, digit, F1-F12 or space."""
+    mods, key = parse_hotkey(spec)
+    key = {'bosluk': 'space'}.get(key.lower(), key)
+    if not (re.fullmatch(r'[A-Za-z0-9]', key) or key.lower() == 'space' or re.fullmatch(r'[fF]([1-9]|1[0-2])', key)):
+        raise ValueError('Linux kisayolunda yalniz harf, rakam, bosluk ya da F1-F12 tusu olabilir')
+    if not [m for m in mods if m in ('ctrl', 'alt', 'cmd')]:
+        raise ValueError('Linux kisayolu Ctrl, Alt ya da Super icermeli')
+    if key.lower() == 'space':
+        name, code, accel = 'Space', 0x20, 'space'
+    elif len(key) == 1:
+        name, code, accel = key.upper(), ord(key.upper()), key.lower()
+    else:
+        name, code, accel = key.upper(), 0x01000030 + int(key[1:]) - 1, key.upper()
+    qt = sum(QT_MODS[m] for m in mods) + code
+    kde = '+'.join([KDE_MODS[m] for m in mods] + [name])
+    return kde, qt, ''.join(GNOME_MODS[m] for m in mods) + accel, kde.replace('Meta', 'Super')
+
+
 def saved_hotkey(state):
     try:
         return json.loads(_state_path(state).read_text(encoding='utf-8')).get('tus') or DEFAULT_HOTKEY
@@ -1128,6 +1383,12 @@ def listen_mac(vault, script, keycode=11, modifiers=0x1000 | 0x800):
     """Carbon RegisterEventHotKey: global, no Accessibility permission, standard library only."""
     import ctypes
     from ctypes import CFUNCTYPE, POINTER, Structure, byref, c_int32, c_uint32, c_void_p
+    try:
+        objc, send = _objc()
+        app = send(objc.objc_getClass(b'NSApplication'), b'sharedApplication')
+        send(app, b'setActivationPolicy:', ctypes.c_void_p, ctypes.c_long(2))  # prohibited: background daemon, no Dock icon
+    except Exception:
+        pass
     carbon = ctypes.CDLL('/System/Library/Frameworks/Carbon.framework/Carbon')
 
     class HotKeyID(Structure):
@@ -1349,7 +1610,7 @@ description: Kullanıcının yakaladığı kaynakları (YouTube videosu, tweet, 
 
 # Beyne at: yakalanan kaynakları işle
 
-Kullanıcı kaynakları tek tuşla yakalar: kısayol (Mac'te Control+Option+B, Windows'ta Ctrl+Alt+B),
+Kullanıcı kaynakları tek tuşla yakalar: kısayol (Mac'te Control+Option+B, Windows'ta Ctrl+Alt+B, Linux'ta KDE ve GNOME'da Ctrl+Alt+B),
 tarayıcıda Obsidian Web Clipper'ın "Beyne at" şablonu ya da Windows'ta sağ tık > Gönder > Beyne At.
 Her yakalama `📥 000-Inbox/Yakala/` içinde tek bir karttır. Kartın `## Neden` bölümü kullanıcının
 niyetidir; dersleri o niyete göre seç.
@@ -1386,13 +1647,13 @@ Windows'ta komutlardaki `python3` yerine `py -3` yaz.
 '''
 
 
-def clipper_template():
+def clipper_template(inbox_path=None):
     return {
         'schemaVersion': '0.1.0',
         'name': TEMPLATE_NAME,
         'behavior': 'create',
         'noteNameFormat': '{{date|date:"YYYY-MM-DD-HHmm"}}-{{title|safe_name|lower|slice:0,48}}',
-        'path': INBOX,
+        'path': inbox_path or INBOX,
         'noteContentFormat': '# {{title}}\n\n## Neden\n\n\n\n## Kaynak\n\n{{url}}\n\n## Secim\n\n{{selection}}\n\n## Icerik\n\n{{content}}\n',
         'properties': [
             {'name': 'tur', 'value': 'yakala', 'type': 'text'},
@@ -1424,7 +1685,11 @@ def _launch_agent():
 
 
 def _listener_ok(wait=1.2):
-    """The listener exits at once when another app already owns the combination."""
+    """The listener exits at once when another app already owns the combination.
+
+    `launchctl print` also succeeds for a job that is loaded but stopped, so only
+    `state = running` counts.
+    """
     import time
     time.sleep(wait)
     probe = subprocess.run(['launchctl', 'print', 'gui/' + str(os.getuid()) + '/' + LAUNCH_LABEL], capture_output=True)
@@ -1530,21 +1795,154 @@ def _argline(values):
     return subprocess.list2cmdline([str(v) for v in values])
 
 
-def install(vault, state, hotkey=True, spec=None):
+DESKTOP_NAME = 'beyne-at.desktop'
+GNOME_KEYS = 'org.gnome.settings-daemon.plugins.media-keys'
+GNOME_PATH = '/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/beyne-at/'
+KGLOBAL = ['gdbus', 'call', '--session', '-d', 'org.kde.kglobalaccel']
+KDE_ACTION = "['beyne-at.desktop','_launch','Beyne At','Beyne At']"
+
+
+def _desktop_file():
+    data = os.environ.get('XDG_DATA_HOME') or ''
+    # The basedir spec: a relative XDG_DATA_HOME is invalid and ignored (it would land under the working directory).
+    return (Path(data) if os.path.isabs(data) else Path.home() / '.local/share') / 'applications' / DESKTOP_NAME
+
+
+def _linux_desktop():
+    current = os.environ.get('XDG_CURRENT_DESKTOP', '').upper()
+    return 'kde' if 'KDE' in current else 'gnome' if 'GNOME' in current else None
+
+
+def _desktop_string(value):
+    """String value of a desktop entry: backslash, newline, tab and carriage return are escaped."""
+    return str(value).replace('\\', '\\\\').replace('\n', '\\n').replace('\t', '\\t').replace('\r', '\\r')
+
+
+def _desktop_quote(arg):
+    """Exec argument per the Desktop Entry spec, then the string-value escaping of the file itself."""
+    arg = str(arg)
+    if not arg or re.search(r'[\s"\'\\><~|&;$*?#()`%]', arg):
+        arg = '"' + re.sub(r'(["`$\\])', r'\\\1', arg).replace('%', '%%') + '"'
+    return _desktop_string(arg)
+
+
+def _desktop_entry(argv, vault):
+    """The launcher file. X-Beyin-Vault names the vault it serves; `kaldir` and `durum` touch only their own."""
+    return ('[Desktop Entry]\nType=Application\nName=Beyne at\nComment=İkinci beyne kaynak yakala\n'
+            'Exec=' + ' '.join(_desktop_quote(a) for a in argv) + '\nTerminal=false\nCategories=Utility;\n'
+            'X-Beyin-Vault=' + _desktop_string(vault) + '\n')
+
+
+def _desktop_owner(path):
+    """Vault the entry at `path` serves; None when it is missing, unreadable or not written by `kur`."""
+    try:
+        lines = Path(path).read_text(encoding='utf-8').split('\n')
+    except (OSError, UnicodeDecodeError):
+        return None
+    unescape = {'n': '\n', 't': '\t', 'r': '\r', 's': ' '}
+    for line in lines:
+        if line.startswith('X-Beyin-Vault='):
+            return re.sub(r'\\(.)', lambda match: unescape.get(match.group(1), match.group(1)), line.split('=', 1)[1])
+    return None
+
+
+def _gnome_list():
+    code, out = _try(['gsettings', 'get', GNOME_KEYS, 'custom-keybindings'])
+    if code != 0:
+        return None
+    try:
+        import ast
+        value = ast.literal_eval(out.strip().replace('@as ', '', 1))
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return None
+    # Anything but a list of strings is not rewritten: the user's own bindings live in it.
+    return list(value) if isinstance(value, list) and all(isinstance(item, str) for item in value) else None
+
+
+def _gvariant(text):
+    """GVariant text of a string. A bare value that starts with a quote makes `gsettings set` fail."""
+    return "'" + str(text).replace('\\', '\\\\').replace("'", "\\'") + "'"
+
+
+def _gnome_set_list(paths):
+    value = '[' + ', '.join(_gvariant(path) for path in paths) + ']'
+    return _try(['gsettings', 'set', GNOME_KEYS, 'custom-keybindings', value])[0] == 0
+
+
+def _gnome_schema():
+    return GNOME_KEYS + '.custom-keybinding:' + GNOME_PATH
+
+
+def _kde_active():
+    code, out = _try(KGLOBAL + ['-o', '/component/beyne_at_desktop', '-m', 'org.kde.kglobalaccel.Component.isActive'])
+    return code == 0 and 'true' in out
+
+
+def _hand_over(vault, state):
+    """The desktop entry starts the copy in the state folder. When the vault has its own module, run that
+    one, so an update reaches the window without a second `kur` (the macOS listener does the same)."""
+    here = Path(__file__).resolve()
+    current = Path(vault) / '.claude/scripts' / here.name
+    if here == (Path(state) / 'yakala' / here.name).resolve() and current.is_file() and current.resolve() != here:
+        try:
+            os.execv(sys.executable, [sys.executable, str(current)] + sys.argv[1:])
+        except OSError:
+            pass  # the copy still opens the window
+
+
+def _linux_hotkey_install(kde, qt, gnome, command):
+    """Registers the key on KDE or GNOME; True/False = key verified, None = desktop not supported."""
+    desktop = _linux_desktop()
+    if desktop == 'kde':
+        writer = _which('kwriteconfig6', 'kwriteconfig5')
+        if not writer or _try([writer, '--file', 'kglobalshortcutsrc', '--group', 'services', '--group', DESKTOP_NAME,
+                               '--key', '_launch', kde])[0] != 0:
+            return False
+        _try([_which('kbuildsycoca6', 'kbuildsycoca5') or 'kbuildsycoca6'], timeout=30)
+        _try(KGLOBAL + ['-o', '/kglobalaccel', '-m', 'org.kde.KGlobalAccel.doRegister', KDE_ACTION])
+        # Flags 6 = SetPresent|NoAutoloading; with 4 alone the key is stored but never grabbed.
+        _try(KGLOBAL + ['-o', '/kglobalaccel', '-m', 'org.kde.KGlobalAccel.setShortcutKeys', KDE_ACTION, '[([%d],)]' % qt, '6'])
+        code, out = _try(KGLOBAL + ['-o', '/kglobalaccel', '-m', 'org.kde.KGlobalAccel.getGlobalShortcutsByKey', str(qt)])
+        return code == 0 and DESKTOP_NAME in out
+    if desktop == 'gnome':
+        paths = _gnome_list()
+        if paths is None:
+            return False
+        if GNOME_PATH not in paths and not _gnome_set_list(paths + [GNOME_PATH]):
+            return False
+        schema = _gnome_schema()
+        for key, value in (('name', 'Beyne at'), ('command', command), ('binding', gnome)):
+            if _try(['gsettings', 'set', schema, key, _gvariant(value)])[0] != 0:
+                return False
+        return GNOME_PATH in (_gnome_list() or [])
+    return None
+
+
+def install(vault, state, hotkey=True, spec=None, folder_spec=None):
     vault, state = Path(vault).resolve(), Path(state).resolve()
     spec = spec or saved_hotkey(state)
-    # Validate before anything is written, so a bad key changes nothing.
+    # Validate before anything is written, so a bad key or folder changes nothing.
     if hotkey and sys.platform == 'darwin':
         keycode, modifiers, label = mac_hotkey(spec)
+    elif hotkey and sys.platform.startswith('linux'):
+        kde_key, qt_key, gnome_key, label = linux_hotkey(spec)
     elif hotkey and os.name == 'nt':
         win_value, label = windows_hotkey(spec)
-    folder = inbox(vault)
+    previous = find_inbox(vault, state)
+    inbox_rel = previous if folder_spec is None else chosen_inbox(vault, folder_spec)
+    if _same_folder(vault / inbox_rel, vault / previous):
+        inbox_rel, left = previous, []  # one spelling for one folder (NFC typed for an NFD name, letter case)
+    else:  # cards are never moved for the user; the ones still queued in the old folder are reported
+        left = [card for card in cards(vault, folder=vault / previous) if card['meta'].get('durum') != 'islendi']
+    folder = vault / inbox_rel
     folder.mkdir(parents=True, exist_ok=True)
     template = folder / (TEMPLATE_NAME.replace(' ', '-').lower() + '-web-clipper.json')
-    template.write_text(json.dumps(clipper_template(), ensure_ascii=False, indent='\t') + '\n', encoding='utf-8')
+    template.write_text(json.dumps(clipper_template(inbox_rel), ensure_ascii=False, indent='\t') + '\n', encoding='utf-8')
     script = Path(__file__).resolve()
-    done = {'status': 'kuruldu', 'klasor': INBOX, 'web_clipper_sablonu': template.relative_to(vault).as_posix(),
+    done = {'status': 'kuruldu', 'klasor': inbox_rel, 'web_clipper_sablonu': template.relative_to(vault).as_posix(),
             'kisayol': None, 'gonder_menusu': False, 'skill': []}
+    if left:
+        done.update(onceki_klasor=previous, onceki_klasorde_kalan=len(left))
     # A vault without the beyin.py entry (standalone use) gets the direct module command.
     if (vault / 'beyin.py').is_file():
         prefix = 'python3 beyin.py yakala'
@@ -1556,16 +1954,16 @@ def install(vault, state, hotkey=True, spec=None):
         skill = vault / root / 'skills/beyin-yakala/SKILL.md'
         if skill.exists() and SKILL_MARK not in skill.read_text(encoding='utf-8', errors='ignore'):
             continue  # the user's own skill with this name stays untouched
-        folder = skill.parent
-        if root == '.claude' and not os.path.lexists(folder) and _links_skills(folder.parent):
+        folder_skill = skill.parent
+        if root == '.claude' and not os.path.lexists(folder_skill) and _links_skills(folder_skill.parent):
             try:  # vaults that keep one source under .agents and link it from .claude
-                folder.symlink_to(Path('../../.agents/skills/beyin-yakala'), target_is_directory=True)
-                done['skill'].append(folder.relative_to(vault).as_posix() + ' -> .agents')
+                folder_skill.symlink_to(Path('../../.agents/skills/beyin-yakala'), target_is_directory=True)
+                done['skill'].append(folder_skill.relative_to(vault).as_posix() + ' -> .agents')
                 continue
             except OSError:
                 pass
-        folder.mkdir(parents=True, exist_ok=True)
-        skill.write_text(SKILL_MD.replace('python3 beyin.py yakala', prefix), encoding='utf-8', newline='\n')
+        folder_skill.mkdir(parents=True, exist_ok=True)
+        skill.write_text(SKILL_MD.replace('python3 beyin.py yakala', prefix).replace('📥 000-Inbox/Yakala', inbox_rel), encoding='utf-8', newline='\n')
         done['skill'].append(skill.relative_to(vault).as_posix())
     if hotkey and sys.platform == 'darwin':
         # The listener runs from a copy outside the vault: a synced folder may evict the original.
@@ -1573,7 +1971,7 @@ def install(vault, state, hotkey=True, spec=None):
         runner.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(script, runner)
         import plistlib
-        plist = {'Label': LAUNCH_LABEL, 'RunAtLoad': True, 'KeepAlive': {'SuccessfulExit': False},
+        plist = {'Label': LAUNCH_LABEL, 'RunAtLoad': True, 'KeepAlive': True,
                  'ProgramArguments': [sys.executable, str(runner), 'dinle', '--vault', str(vault),
                                       '--keycode', str(keycode), '--mods', str(modifiers)],
                  'ProcessType': 'Interactive', 'StandardErrorPath': str(state / 'yakala' / 'dinleyici.log'),
@@ -1590,6 +1988,28 @@ def install(vault, state, hotkey=True, spec=None):
         subprocess.run(['launchctl', 'bootstrap', domain, str(agent)], check=True, capture_output=True)
         done['kisayol'] = label
         done['kisayol_calisiyor'] = _listener_ok()
+    elif hotkey and sys.platform.startswith('linux'):
+        runner = state / 'yakala' / script.name  # copy outside the vault, like the macOS listener
+        runner.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(script, runner)
+        argv = [sys.executable, str(runner), 'pencere', '--vault', str(vault)]
+        entry = _desktop_file()
+        previous = _desktop_owner(entry)
+        if previous and previous != str(vault):
+            done['onceki_vault'] = previous  # the hotkey moves to this vault
+        entry.parent.mkdir(parents=True, exist_ok=True)
+        entry.write_text(_desktop_entry(argv, vault), encoding='utf-8', newline='\n')
+        import shlex
+        command = shlex.join(argv)
+        running = _linux_hotkey_install(kde_key, qt_key, gnome_key, command)
+        if running is None:
+            done['ipucu'] = 'Masaustu ayarlarindan su komuta bir kisayol bagla: ' + command
+        else:
+            done.update(kisayol=label, kisayol_calisiyor=running)
+            if not running:  # a missing tool or a refused call is not an error: the command still works by hand
+                done['ipucu'] = 'Kisayol dogrulanamadi; calismiyorsa masaustu ayarlarindan su komuta elle bagla: ' + command
+        if not _linux_window():
+            done['uyari'] = LINUX_NO_WINDOW
     elif hotkey and os.name == 'nt':
         pythonw = Path(sys.executable).with_name('pythonw.exe')
         target = pythonw if pythonw.is_file() else Path(sys.executable)
@@ -1615,7 +2035,8 @@ def install(vault, state, hotkey=True, spec=None):
         done['kisayol_calisiyor'] = _windows_listener_ok(vault, listener)
     state.mkdir(parents=True, exist_ok=True)
     _state_path(state).write_text(json.dumps({'schema': 1, 'session_notice': True, 'kisayol': done['kisayol'],
-                                              'tus': spec if done['kisayol'] else saved_hotkey(state)}, ensure_ascii=False) + '\n',
+                                              'tus': spec if done['kisayol'] else saved_hotkey(state),
+                                              'klasor': inbox_rel}, ensure_ascii=False) + '\n',
                                   encoding='utf-8')
     done['araclar'] = {name: bool(path) for name, path in tools().items()}
     return done
@@ -1629,6 +2050,21 @@ def uninstall(vault, state):
         subprocess.run(['launchctl', 'bootout', 'gui/' + str(os.getuid()) + '/' + LAUNCH_LABEL], capture_output=True)
         _launch_agent().unlink()
         removed.append('LaunchAgent')
+    elif sys.platform.startswith('linux') and _desktop_owner(_desktop_file()) == str(Path(vault).resolve()):
+        _desktop_file().unlink()
+        removed.append(DESKTOP_NAME)
+        desktop = _linux_desktop()
+        if desktop == 'kde':
+            writer = _which('kwriteconfig6', 'kwriteconfig5')
+            if writer:
+                _try([writer, '--file', 'kglobalshortcutsrc', '--group', 'services', '--group', DESKTOP_NAME,
+                      '--key', '_launch', '--delete'])
+            _try(KGLOBAL + ['-o', '/kglobalaccel', '-m', 'org.kde.KGlobalAccel.unregister', DESKTOP_NAME, '_launch'])
+        elif desktop == 'gnome':
+            paths = _gnome_list() or []
+            if GNOME_PATH in paths:
+                _gnome_set_list([p for p in paths if p != GNOME_PATH])
+            _try(['gsettings', 'reset-recursively', _gnome_schema()])
     elif os.name == 'nt':
         # Only this vault's listener and startup entry. When another vault's entry is there instead,
         # its `kur` rewrote the Start menu and Send To shortcuts too: they are no longer this vault's.
@@ -1666,13 +2102,18 @@ def status(vault, state):
     installed = _state_path(state).is_file()
     running = None
     if sys.platform == 'darwin' and _agent_vault() == str(Path(vault).resolve()):
-        probe = subprocess.run(['launchctl', 'print', 'gui/' + str(os.getuid()) + '/' + LAUNCH_LABEL], capture_output=True)
-        running = probe.returncode == 0
+        running = _listener_ok(wait=0)
     elif os.name == 'nt' and _windows_listener_link(vault).exists():
         # None without this vault's startup entry: a 3.9.0 install or --kisayol-yok has no listener.
         running = _windows_listener_running(vault)
+    elif sys.platform.startswith('linux') and _desktop_owner(_desktop_file()) == str(Path(vault).resolve()):
+        desktop = _linux_desktop()
+        if desktop == 'kde':
+            running = _kde_active()
+        elif desktop == 'gnome':
+            running = GNOME_PATH in (_gnome_list() or [])
     return {'status': 'tamam', 'kurulu': installed, 'dinleyici_calisiyor': running,
-            'bekleyen': pending(vault), 'klasor': INBOX,
+            'bekleyen': pending(vault, state), 'klasor': find_inbox(vault, state),
             'araclar': {name: bool(path) for name, path in tools().items()}}
 
 
@@ -1725,8 +2166,15 @@ def human(result, command):
             lines.append('Kisayol: ' + result['kisayol'] + ' (her uygulamada calisir).')
         if result.get('kisayol_calisiyor') is False:
             lines.append('UYARI: kisayol dinleyicisi baslamadi; bu tus baska bir uygulamada kayitli olabilir. Baska bir tus dene.')
+        if result.get('ipucu'):
+            lines.append(result['ipucu'])
+        if result.get('uyari'):
+            lines.append('UYARI: ' + result['uyari'])
         if command == 'kisayol':
             return '\n'.join(lines)
+        if result.get('onceki_klasorde_kalan'):
+            lines.append('UYARI: ' + str(result['onceki_klasorde_kalan']) + ' kart eski klasorde kaldi (' + result['onceki_klasor'] +
+                         '); tasinmadi. Islenmeleri icin yeni klasore tasi: ' + result['klasor'])
         if result.get('gonder_menusu'):
             lines.append('Dosyalar icin: sag tik > Gonder > Beyne At.')
         lines.append('Tarayici icin Obsidian Web Clipper eklentisini kur, Ayarlar > Sablonlar > Ice aktar ile su dosyayi sec:')
@@ -1739,7 +2187,8 @@ def human(result, command):
         return 'Yakala kaldirildi. Yakalanan notlar yerinde duruyor.'
     if command == 'durum':
         return ('Kurulu: ' + ('evet' if result['kurulu'] else 'hayir') +
-                ('' if result['dinleyici_calisiyor'] is None else '\nKisayol dinleyicisi: ' + ('calisiyor' if result['dinleyici_calisiyor'] else 'durmus')) +
+                ('' if result['dinleyici_calisiyor'] is None else '\nKisayol dinleyicisi: ' +
+                 ('calisiyor' if result['dinleyici_calisiyor'] else 'durmus (baslatmak icin: beyin.py yakala kur)')) +
                 '\nBekleyen kaynak: ' + str(result['bekleyen']) +
                 '\nAraclar: ' + ', '.join(n + ('=var' if ok else '=yok') for n, ok in result['araclar'].items()))
     if result.get('status') == 'islendi':
@@ -1807,6 +2256,7 @@ def main(argv=None, vault=None, state=None):
     setup = command_parser('kur', help='Kisayolu, Web Clipper sablonunu, skill\'i ve oturum bildirimini kur')
     setup.add_argument('--kisayol-yok', action='store_true', help='Yalniz sablon, skill ve bildirim; kisayol kurulmaz')
     setup.add_argument('--tus', help='Kisayol, ornek: ctrl+alt+b (varsayilan) ya da cmd+"')
+    setup.add_argument('--klasor', help='Kartlarin yazilacagi klasor, vault icinde (ornek: 000-Inbox/Yakala)')
     keys = command_parser('kisayol', help='Kisayolu goster ya da degistir, ornek: kisayol \'cmd+"\'')
     keys.add_argument('tus', nargs='?')
     command_parser('kaldir', help='Kisayolu ve bildirimi kaldir; notlara dokunmaz')
@@ -1821,8 +2271,10 @@ def main(argv=None, vault=None, state=None):
     command = args.command or 'pencere'
     as_json = args.force_json or not sys.stdout or not sys.stdout.isatty()
     if command == 'pencere':
+        if argv is None and sys.platform.startswith('linux'):
+            _hand_over(vault, state)  # started by the hotkey from the state copy
         context = json.loads(args.baglam) if getattr(args, 'baglam', None) else gather_context()
-        result = popup(vault, context)
+        result = popup(vault, context, state)
     elif command == 'dinle':
         if sys.platform == 'darwin':
             listen_mac(vault, Path(__file__).resolve(), args.keycode, args.mods)
@@ -1840,15 +2292,15 @@ def main(argv=None, vault=None, state=None):
             else:
                 texts.append(item)
         text = args.metin or ('\n'.join(texts) if texts else None)
-        result = capture(vault, url=url, text=text, files=files, why=args.neden, title=args.baslik, tool=args.arac)
+        result = capture(vault, url=url, text=text, files=files, why=args.neden, title=args.baslik, tool=args.arac, state=state)
     elif command == 'isle':
-        result = process(vault, args.ids or None, allow_audio=not args.ses_yok, retry=args.tekrar)
+        result = process(vault, args.ids or None, allow_audio=not args.ses_yok, retry=args.tekrar, state=state)
     elif command == 'bitti':
-        result = finish(vault, args.id, args.bilgi, args.ozet)
+        result = finish(vault, args.id, args.bilgi, args.ozet, state=state)
     elif command == 'liste':
-        result = listing(vault, args.durum)
+        result = listing(vault, args.durum, state)
     elif command == 'kur':
-        result = install(vault, state, hotkey=not args.kisayol_yok, spec=args.tus)
+        result = install(vault, state, hotkey=not args.kisayol_yok, spec=args.tus, folder_spec=args.klasor)
     elif command == 'kisayol':
         if args.tus:
             result = install(vault, state, spec=args.tus)
@@ -1862,7 +2314,7 @@ def main(argv=None, vault=None, state=None):
     elif command == 'durum':
         result = status(vault, state)
     else:
-        result = clipper_template()
+        result = clipper_template(find_inbox(vault, state))
     if sys.stdout is None:
         return 0
     if as_json or command == 'sablon':
