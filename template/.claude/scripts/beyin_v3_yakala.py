@@ -1261,7 +1261,11 @@ def _launch_agent():
 
 
 def _listener_ok(wait=1.2):
-    """The listener exits at once when another app already owns the combination."""
+    """The listener exits at once when another app already owns the combination.
+
+    `launchctl print` also succeeds for a job that is loaded but stopped, so only
+    `state = running` counts.
+    """
     import time
     time.sleep(wait)
     probe = subprocess.run(['launchctl', 'print', 'gui/' + str(os.getuid()) + '/' + LAUNCH_LABEL], capture_output=True)
@@ -1420,8 +1424,7 @@ def status(vault, state):
     installed = _state_path(state).is_file()
     running = None
     if sys.platform == 'darwin' and _agent_vault() == str(Path(vault).resolve()):
-        probe = subprocess.run(['launchctl', 'print', 'gui/' + str(os.getuid()) + '/' + LAUNCH_LABEL], capture_output=True)
-        running = probe.returncode == 0
+        running = _listener_ok(wait=0)
     return {'status': 'tamam', 'kurulu': installed, 'dinleyici_calisiyor': running,
             'bekleyen': pending(vault), 'klasor': INBOX,
             'araclar': {name: bool(path) for name, path in tools().items()}}
@@ -1490,7 +1493,8 @@ def human(result, command):
         return 'Yakala kaldirildi. Yakalanan notlar yerinde duruyor.'
     if command == 'durum':
         return ('Kurulu: ' + ('evet' if result['kurulu'] else 'hayir') +
-                ('' if result['dinleyici_calisiyor'] is None else '\nKisayol dinleyicisi: ' + ('calisiyor' if result['dinleyici_calisiyor'] else 'durmus')) +
+                ('' if result['dinleyici_calisiyor'] is None else '\nKisayol dinleyicisi: ' +
+                 ('calisiyor' if result['dinleyici_calisiyor'] else 'durmus (baslatmak icin: beyin.py yakala kur)')) +
                 '\nBekleyen kaynak: ' + str(result['bekleyen']) +
                 '\nAraclar: ' + ', '.join(n + ('=var' if ok else '=yok') for n, ok in result['araclar'].items()))
     if result.get('status') == 'islendi':

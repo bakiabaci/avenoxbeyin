@@ -264,6 +264,21 @@ class YakalaUnitTest(unittest.TestCase):
         self.assertIn('LaunchAgent', result['kaldirilan'])
         self.assertFalse(agent.exists() or runner.exists() or (state / 'yakala.json').exists())
 
+    def test_status_tells_a_loaded_but_stopped_listener(self):
+        state, agent = Path(self.tmp.name) / 'mac-state', Path(self.tmp.name) / 'agent.plist'
+        answer = [b'\tstate = running\n']
+
+        def launchctl(command, **_options):
+            return subprocess.CompletedProcess(command, 0, answer[0], b'')
+        with self.mac(agent, launchctl):
+            yakala.install(self.vault, state)
+            self.assertIs(yakala.status(self.vault, state)['dinleyici_calisiyor'], True)
+            # What `launchctl print` says after Dock > Quit on a 3.9.0 install: exit status 0, job still loaded.
+            answer[0] = b'\tstate = not running\n\tlast exit code = 0\n'
+            stopped = yakala.status(self.vault, state)
+        self.assertIs(stopped['dinleyici_calisiyor'], False)
+        self.assertIn('durmus (baslatmak icin: beyin.py yakala kur)', yakala.human(stopped, 'durum'))
+
     def test_inbox_report_skips_processed_cards(self):
         import beyin_v3_hygiene as hygiene
         waiting = yakala.capture(self.vault, url='https://ornek.com/a')
