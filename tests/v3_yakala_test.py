@@ -258,11 +258,18 @@ class YakalaInstalledTest(unittest.TestCase):
     @unittest.skipUnless(sys.platform == 'win32', 'Windows Start menu and Send To shortcuts')
     def test_windows_shortcuts(self):
         appdata = Path(self.env['APPDATA'])
+
+        def stop():  # a failed assertion must not leave the listener behind
+            with patch.dict(yakala.os.environ, {'APPDATA': self.env['APPDATA']}):
+                yakala._windows_stop_listener()
+        self.addCleanup(stop)
         installed = self.entry('kur')
         self.assertEqual(installed['kisayol'], 'Ctrl+Alt+B')
         start = appdata / 'Microsoft/Windows/Start Menu/Programs/Beyne At.lnk'
         sendto = appdata / 'Microsoft/Windows/SendTo/Beyne At.lnk'
-        startup = appdata / 'Microsoft/Windows/Start Menu/Programs/Startup/Beyne At Dinleyici.lnk'
+        # One startup entry per vault; the hash keeps another vault's `kaldir` away from it.
+        startup = appdata / ('Microsoft/Windows/Start Menu/Programs/Startup/Beyne At Dinleyici ' +
+                             yakala._windows_digest(self.vault)[:8] + '.lnk')
         self.assertTrue(start.is_file() and sendto.is_file())
         self.assertTrue(startup.is_file())
         self.assertIsInstance(yakala.windows_context(), dict)
