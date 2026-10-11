@@ -243,6 +243,44 @@ class StatSignatureTest(unittest.TestCase):
         self.sync_both()
         self.assertEqual(self.record('note')['text'], 'Omega calibration.\n')
 
+    def test_a_replaced_file_is_known_by_its_file_id_alone(self):
+        path = self.write()
+        with patch.object(subject, '_stat_signature', tunneled_signature):
+            self.settle()
+            before = path.stat()
+            replacement = path.with_name('note.md.tmp')
+            replacement.write_bytes(path.read_bytes().replace(b'Alpha', b'Omega'))
+            self.put_back(replacement, before)
+            os.replace(replacement, path)
+            self.sync_both()
+            self.assertEqual(self.record('note')['text'], 'Omega calibration.\n')
+
+    def test_the_first_proposed_signature_misses_these_edits(self):
+        # Size and mtime alone, trusted at once: why the signature and the waits above exist.
+        path = self.write()
+        with patch.object(subject, '_stat_signature', weak_signature):
+            self.settle()
+            before = path.stat()
+            self.rewrite_same_size(path, b'Alpha', b'Omega')
+            self.put_back(path, before)
+            with self.later():
+                self.engine.sync()
+            self.assertEqual(self.record('note')['text'], 'Alpha calibration.\n')
+            self.assertEqual(self.engine.store._eligible()[1], 1)
+
+    def test_a_lost_ownership_row_is_restored(self):
+        # A hit needs markdown_sources to give the id to this source; without the row a full
+        # read adopts the record again, so the cached sync must read too.
+        self.write()
+        self.settle()
+        for engine in (self.engine, self.oracle):
+            with engine.store._connect() as db:
+                db.execute("DELETE FROM markdown_sources WHERE id='note'")
+        self.sync_both()
+        self.assertEqual(self.last_reads, ['note.md', 'note.md'])
+        with self.engine.store._connect() as db:
+            self.assertEqual(db.execute('SELECT id, source FROM markdown_sources').fetchall(), [('note', 'notes/note.md')])
+
     def test_a_clock_set_back_is_indexed(self):
         path = self.write()
         self.settle()
@@ -454,6 +492,310 @@ class StatSignatureTest(unittest.TestCase):
         with self.reads() as calls, clock(20):
             self.engine.sync()
         self.assertEqual(calls, [])
+
+    def test_a_backup_restored_over_an_edit_is_indexed(self):
+        # cp -p: the old bytes and the old mtime come back in place.
+        path = self.write()
+        self.settle()
+        backup = self.root / 'backup.md'
+        shutil.copy2(path, backup)
+        put(path, get(path).replace('Alpha', 'A much longer edit of the'))
+        self.settle()
+        shutil.copy2(backup, path)
+        self.sync_both()
+        self.assertEqual(self.record('note')['text'], 'Alpha calibration.\n')
+        self.sync_both()
+
+    @unittest.skipIf(os.name == 'nt', NO_CHANGE_TIME)
+    def test_a_backup_restored_over_an_edit_of_one_size_and_mtime_is_indexed(self):
+        path = self.write()
+        self.settle()
+        before = path.stat()
+        backup = self.root / 'backup.md'
+        shutil.copy2(path, backup)
+        self.rewrite_same_size(path, b'Alpha', b'Omega')
+        self.put_back(path, before)
+        self.settle()
+        self.assertEqual(self.record('note')['text'], 'Omega calibration.\n')
+        shutil.copy2(backup, path)
+        self.assertEqual((path.stat().st_size, path.stat().st_mtime_ns), (before.st_size, before.st_mtime_ns))
+        self.sync_both()
+        self.assertEqual(self.record('note')['text'], 'Alpha calibration.\n')
+
+    def test_renames_are_followed(self):
+        labelled = self.write('notes/labelled.md', id='labelled')
+        plain = put(self.vault / 'notes/plain.md', 'A note without frontmatter.\n')
+        self.settle()
+        with self.engine.store._connect() as db:
+            plain_id, = db.execute("SELECT id FROM markdown_sources WHERE source='notes/plain.md'").fetchone()
+        os.rename(labelled, labelled.with_name('moved.md'))
+        os.rename(plain, plain.with_name('plain-moved.md'))
+        self.assertEqual(self.sync_both()['deleted'], 1)
+        self.assertEqual(self.record('labelled')['source'], 'notes/moved.md')
+        self.assertIsNone(self.record(plain_id))
+        self.assertEqual(set(self.signatures()), {'notes/moved.md', 'notes/plain-moved.md'})
+        self.settle()
+        # A directory rename changes no stat field of the files below it.
+        os.rename(self.vault / 'notes', self.vault / 'archive')
+        self.sync_both()
+        self.assertEqual(sorted(set(self.last_reads)), ['moved.md', 'plain-moved.md'])
+        self.assertEqual(self.record('labelled')['source'], 'archive/moved.md')
+        self.assertEqual(set(self.signatures()), {'archive/moved.md', 'archive/plain-moved.md'})
+        self.settle()
+        self.sync_both()
+        self.assertEqual(self.last_reads, [])
+
+    def test_a_case_only_rename_is_followed(self):
+        # One file under a new spelling on a case-insensitive volume, a plain rename elsewhere.
+        path = self.write('notes/Note.md')
+        self.settle()
+        os.rename(path, path.with_name('note.md'))
+        self.sync_both()
+        self.assertEqual(self.record('note')['source'], 'notes/note.md')
+        self.assertEqual(set(self.signatures()), {'notes/note.md'})
+        self.settle()
+
+    def test_a_note_moved_out_and_back_is_read_again(self):
+        # While it was away the walk did not reach it: its record and its signature left with it,
+        # so an edit that no stat field shows is still read when it returns.
+        path = self.write()
+        self.write('notes/other.md', id='other')
+        with patch.object(subject, '_stat_signature', coarse_signature):
+            self.settle()
+            before = path.stat()
+            away = self.root / 'away.md'
+            os.rename(path, away)
+            self.assertEqual(self.sync_both()['deleted'], 1)
+            self.assertEqual(set(self.signatures()), {'notes/other.md'})
+            self.rewrite_same_size(away, b'Alpha', b'Omega')
+            self.put_back(away, before)
+            os.rename(away, path)
+            self.sync_both()
+            self.assertEqual(sorted(set(self.last_reads)), ['note.md'])
+            self.assertEqual(self.record('note')['text'], 'Omega calibration.\n')
+
+    @unittest.skipIf(os.name == 'nt', NO_CHANGE_TIME)
+    def test_a_note_edited_outside_the_vault_between_two_syncs_is_indexed(self):
+        path = self.write()
+        self.settle()
+        before = path.stat()
+        away = self.root / 'away.md'
+        os.rename(path, away)
+        self.rewrite_same_size(away, b'Alpha', b'Omega')
+        self.put_back(away, before)
+        os.rename(away, path)
+        self.sync_both()
+        self.assertEqual(self.record('note')['text'], 'Omega calibration.\n')
+
+    @unittest.skipIf(os.name == 'nt', 'not run on NTFS: a hard link is reasoned about in the review, not asserted')
+    def test_hard_links_are_two_sources_of_one_file(self):
+        first = put(self.vault / 'notes/first.md', 'Alpha calibration.\n')
+        second = self.vault / 'notes/second.md'
+        try:
+            os.link(first, second)
+        except (OSError, NotImplementedError, AttributeError):
+            self.skipTest('hard links unavailable on this filesystem')
+        self.settle()
+        self.sync_both()
+        self.assertEqual(self.last_reads, [])
+        self.rewrite_same_size(first, b'Alpha', b'Omega')
+        self.assertEqual(self.sync_both()['indexed'], 2)
+        self.assertEqual(sorted(set(self.last_reads)), ['first.md', 'second.md'])
+        with self.engine.store._connect() as db:
+            texts = [json.loads(row[0])['text'] for row in db.execute('SELECT payload FROM records')]
+        self.assertEqual(texts, ['Omega calibration.\n'] * 2)
+
+    def test_a_note_replaced_by_a_symlink_is_rejected_on_every_sync(self):
+        path = self.write()
+        target = self.write('notes/target.md', id='target')
+        self.settle()
+        path.unlink()
+        try:
+            path.symlink_to(target)
+        except (OSError, NotImplementedError):
+            self.skipTest('symlinks unavailable on this platform')
+        for _ in range(3):
+            result = self.sync_both()
+            self.assertEqual(result['warnings'], [{'source': 'notes/note.md', 'reason': 'symlink source rejected'}])
+            self.assertIsNone(self.record('note'))
+            self.assertIsNotNone(self.record('target'))
+        self.assertEqual(set(self.signatures()), {'notes/target.md'})
+
+    def test_a_source_dated_in_the_future_is_read_every_time(self):
+        # A note stamped ahead of the clock (another device, a wrong date) never settles.
+        path = self.write()
+        self.write('notes/other.md', id='other')
+        future = time.time_ns() + 86_400 * 1_000_000_000
+        os.utime(path, ns=(future, future))
+        self.settle()
+        for old, new in ((b'Alpha', b'Omega'), (b'Omega', b'Gamma')):
+            self.sync_both()
+            self.assertEqual(sorted(set(self.last_reads)), ['note.md'])
+            self.assertEqual(self.signatures()['notes/note.md'][0], '')
+            self.rewrite_same_size(path, old, new)
+            os.utime(path, ns=(future, future))
+        self.sync_both()
+        self.assertEqual(self.record('note')['text'], 'Gamma calibration.\n')
+
+    def test_a_directory_that_becomes_excluded_takes_its_signatures_with_it(self):
+        # node_modules is the exclusion the walk has today; a configured name prunes the same
+        # walk. Excluded: the records and signature rows below it leave. Included again: the
+        # files are read, even when no stat field of theirs moved.
+        path = self.write('notes/pkg/note.md')
+        self.write('notes/pkg/deep/inner.md', id='inner')
+        self.write('notes/keep.md', id='keep')
+        with patch.object(subject, '_stat_signature', coarse_signature):
+            self.settle()
+            self.assertEqual(set(self.signatures()), {'notes/keep.md', 'notes/pkg/note.md', 'notes/pkg/deep/inner.md'})
+            before = path.stat()
+            os.rename(self.vault / 'notes/pkg', self.vault / 'notes/node_modules')
+            result = self.sync_both()
+            self.assertEqual((result['indexed'], result['deleted']), (1, 2))
+            self.assertEqual(set(self.signatures()), {'notes/keep.md'})
+            self.assertEqual(self.last_reads, [])
+            hidden = self.vault / 'notes/node_modules/note.md'
+            self.rewrite_same_size(hidden, b'Alpha', b'Omega')
+            self.put_back(hidden, before)
+            for _ in range(2):
+                self.sync_both()
+            os.rename(self.vault / 'notes/node_modules', self.vault / 'notes/pkg')
+            self.assertEqual(self.sync_both()['indexed'], 3)
+            self.assertEqual(sorted(set(self.last_reads)), ['inner.md', 'note.md'])
+            self.assertEqual(self.record('note')['text'], 'Omega calibration.\n')
+            self.settle()
+            self.sync_both()
+            self.assertEqual(self.last_reads, [])
+
+    def test_read_time_diagnostics_are_reported_on_every_warm_sync(self):
+        # A source that only warns is never indexed, so it has no signature and is read each time.
+        self.write('notes/good.md', id='good')
+        self.write('notes/dead.md', id='dead', supersedes=['no-such-record'])
+        self.write('notes/generated.md', id='generated', generated=True)
+        self.write('notes/visibility.md', id='visibility', visibility='secret')
+        put(self.vault / 'notes/yaml.md', '---\nid: yaml\nnested: {a: 1}\n---\nBody.\n')
+        put(self.vault / 'notes/task.md', '---\nid: task\nkind: task\n---\n---\nid: inner\n---\nBody.\n')
+        put(self.vault / 'notes/open.md', '---\nid: open\nBody.\n')
+        (self.vault / 'notes/binary.md').write_bytes(b'\xff\xfe\x00not utf-8')
+        first = self.sync_both()
+        self.assertEqual(first['status'], 'degraded')
+        self.assertEqual(sorted(warning['source'] for warning in first['warnings']),
+                         ['notes/binary.md', 'notes/open.md', 'notes/task.md', 'notes/visibility.md', 'notes/yaml.md'])
+        self.assertEqual((first['indexed'], first['supersedes_issue_count']), (2, 1))
+        for _ in range(4):
+            self.assertEqual(self.sync_both(), first)
+        self.assertEqual(sorted(set(self.last_reads)),
+                         ['binary.md', 'generated.md', 'open.md', 'task.md', 'visibility.md', 'yaml.md'])
+        self.assertEqual(set(self.signatures()), {'notes/good.md', 'notes/dead.md'})
+
+    def test_a_receipt_divergence_is_reported_on_every_warm_sync(self):
+        # #205/#239: another device wrote the same event_id and the merge kept its file.
+        self.write('notes/task.md', id='task')
+        other = self.root / 'other-vault'
+        put(other / 'notes/task.md', get(self.vault / 'notes/task.md'))
+        there = subject.SyncEngine(other, self.root / 'other-state')
+        mine = self.engine.receipt('shared-topic', 'Calibration done here.', ['notes/task.md'], 'codex')
+        there.receipt('shared-topic', 'Calibration done there.', ['notes/task.md'], 'claude')
+        source = self.vault / mine['source']
+        source.unlink()
+        source.write_bytes((other / mine['source']).read_bytes())
+        for _ in range(4):
+            with self.later(), self.reads() as calls:
+                result = self.engine.sync()
+            self.assertEqual(result['status'], 'conflict')
+            self.assertEqual([conflict['source'] for conflict in result['conflicts']
+                              if conflict.get('kind') == 'receipt_divergence'], [mine['source']])
+        self.assertNotIn('task.md', calls)
+
+    def test_a_task_written_through_the_engine_is_read_back(self):
+        # The write path replaces the source and syncs in one call, inside the racy window.
+        put(self.vault / 'notes/task.md', subject.render(dict(id='task', kind='task', revision=1, status='active'), 'Calibrate.\n'))
+        self.settle()
+        with self.later():
+            updated = self.engine.update_task('task', 1, {'status': 'waiting'})
+        self.assertEqual(updated['revision'], 2)
+        self.assertEqual(self.signatures()['notes/task.md'][0], '')
+        with self.later():
+            self.oracle.sync()
+        self.assertEqual(self.snapshot(self.engine), self.snapshot(self.oracle))
+        self.settle()
+        self.assertEqual(self.record('task')['status'], 'waiting')
+        self.sync_both()
+        self.assertEqual(self.last_reads, [])
+
+    def test_a_missing_or_foreign_signature_table_is_rebuilt(self):
+        # Under an unchanged code version: a tool dropped the table, or left one of another shape.
+        self.write()
+        for statements in (('DROP TABLE source_signatures',),
+                           ('DROP TABLE source_signatures',
+                            'CREATE TABLE source_signatures(source TEXT PRIMARY KEY, id TEXT NOT NULL)',
+                            "INSERT INTO source_signatures VALUES ('notes/note.md','note')")):
+            self.settle()
+            with self.engine.store._connect() as db:
+                for statement in statements:
+                    db.execute(statement)
+            self.sync_both()
+            self.assertEqual(self.last_reads, ['note.md', 'note.md'])
+            self.assertEqual(self.signatures()['notes/note.md'][0], '')
+
+    def test_a_sync_that_fails_before_commit_leaves_no_signature_behind(self):
+        # Records and signatures are one transaction: neither survives without the other.
+        path = self.write()
+        self.settle()
+        settled = self.signatures()
+        self.rewrite_same_size(path, b'Alpha', b'Omega')
+        before = self.snapshot(self.engine)
+        with patch.object(subject, 'project_receipts', side_effect=RuntimeError('crash after the signatures')), self.later():
+            with self.assertRaises(RuntimeError):
+                self.engine.sync()
+        self.assertEqual(self.snapshot(self.engine), before)
+        self.assertEqual(self.signatures(), settled)
+        self.sync_both()
+        self.assertEqual(self.record('note')['text'], 'Omega calibration.\n')
+
+    def test_two_writers_of_one_state_share_the_signatures(self):
+        # SQLite's write lock serializes whole syncs, so each one sees the other's finished rows.
+        paths = [self.write(f'notes/note-{index}.md', id=f'note-{index}') for index in range(6)]
+        second = subject.SyncEngine(self.vault, self.state)
+        self.settle()
+        self.rewrite_same_size(paths[0], b'Alpha', b'Omega')
+        errors = []
+
+        def run(engine):
+            try:
+                for _ in range(4):
+                    engine.sync()
+            except Exception as exc:  # reported below, in the test's thread
+                errors.append(exc)
+
+        with self.later():
+            threads = [threading.Thread(target=run, args=(engine,)) for engine in (self.engine, second)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.oracle.sync()
+        self.assertEqual(errors, [])
+        self.assertEqual(self.snapshot(self.engine), self.snapshot(self.oracle))
+        self.settle()
+        with self.reads() as calls, self.later():
+            self.assertEqual(second.sync()['indexed'], 6)
+        self.assertEqual(calls, [])
+
+    def test_a_vault_and_state_copied_from_another_machine_are_read_again(self):
+        # Same paths, bytes and mtimes, other files: no signature of the first machine matches.
+        for index in range(3):
+            self.write(f'notes/note-{index}.md', id=f'note-{index}')
+        self.settle()
+        elsewhere = self.root / 'first-machine'
+        os.rename(self.vault, elsewhere)
+        shutil.copytree(elsewhere, self.vault)
+        changed = self.vault / 'notes/note-0.md'
+        before = changed.stat()
+        self.rewrite_same_size(changed, b'Alpha', b'Omega')
+        self.put_back(changed, before)
+        self.sync_both()
+        self.assertEqual(sorted(set(self.last_reads)), ['note-0.md', 'note-1.md', 'note-2.md'])
+        self.assertEqual(self.record('note-0')['text'], 'Omega calibration.\n')
 
     def test_a_full_sync_reads_what_no_stat_can_show(self):
         # The limit of any stat cache: an in-place edit of the same size with its mtime put back,
