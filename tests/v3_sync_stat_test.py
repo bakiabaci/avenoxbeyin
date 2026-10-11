@@ -4,6 +4,9 @@
 Every case is checked against LegacySyncEngine, the frozen engine that reads every source,
 on its own state directory over the same vault. A cache hit must give the same sync report
 and the same events, records and ownership rows as reading the bytes.
+
+Fixtures are written and read as bytes: text mode would turn '\n' into '\r\n' on Windows,
+and the expected texts below are LF.
 """
 from contextlib import contextmanager
 import errno
@@ -22,6 +25,16 @@ from v3_sync_warm_test import LegacySyncEngine
 subject = load_module()
 SCRIPTS = Path(subject.__file__).resolve().parent
 _real_time_ns = time.time_ns
+
+
+def put(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(text.encode('utf-8'))
+    return path
+
+
+def get(path):
+    return path.read_bytes().decode('utf-8')
 
 
 def coarse_signature(st):
@@ -56,10 +69,7 @@ class StatSignatureTest(unittest.TestCase):
         self.minutes = 0
 
     def write(self, name='notes/note.md', id='note', text='Alpha calibration.\n', **fields):
-        path = self.vault / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(subject.render(dict(id=id, kind='note', revision=1, **fields), text), encoding='utf-8', newline='')
-        return path
+        return put(self.vault / name, subject.render(dict(id=id, kind='note', revision=1, **fields), text))
 
     def snapshot(self, engine):
         with engine.store._connect() as db:
@@ -187,7 +197,7 @@ class StatSignatureTest(unittest.TestCase):
         path = self.write()
         self.settle()
         before = path.stat()
-        path.write_text(path.read_text(encoding='utf-8').replace('Alpha', 'Earlier clock'), encoding='utf-8')
+        put(path, get(path).replace('Alpha', 'Earlier clock'))
         os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns - 3600 * 1_000_000_000))
         with clock(-3600):
             result = self.engine.sync()
@@ -248,7 +258,7 @@ class StatSignatureTest(unittest.TestCase):
     def test_conflict_markers_stay_visible(self):
         path = self.write()
         self.settle()
-        path.write_text(path.read_text(encoding='utf-8') + '<<<<<<< ours\nA\n=======\nB\n>>>>>>> theirs\n', encoding='utf-8')
+        put(path, get(path) + '<<<<<<< ours\nA\n=======\nB\n>>>>>>> theirs\n')
         for _ in range(3):
             result = self.sync_both()
             self.assertEqual(result['warnings'], [{'source': 'notes/note.md',
@@ -272,19 +282,19 @@ class StatSignatureTest(unittest.TestCase):
         views = [path for path in self.vault.rglob('*.md') if 'v3' in path.parts]
         self.assertTrue(views)
         view = views[0]
-        view.write_text(view.read_text(encoding='utf-8') + '\nEdited by hand.\n', encoding='utf-8')
+        put(view, get(view) + '\nEdited by hand.\n')
         relative = view.relative_to(self.vault).as_posix()
         for _ in range(3):
             with self.later():
                 result = self.engine.sync()
             self.assertIn({'source': relative, 'reason': 'manual receipt view edit preserved'}, result['conflicts'])
-            self.assertTrue(view.read_text(encoding='utf-8').endswith('Edited by hand.\n'))
+            self.assertTrue(get(view).endswith('Edited by hand.\n'))
 
     def test_outside_vault_symlink_is_rejected_on_every_sync(self):
         self.write()
         outside = self.root / 'outside'
         outside.mkdir()
-        (outside / 'outside.md').write_text('Outside source.\n', encoding='utf-8', newline='')
+        put(outside / 'outside.md', 'Outside source.\n')
         try:
             (self.vault / 'outside-link.md').symlink_to(outside / 'outside.md')
             (self.vault / 'broken-link.md').symlink_to(outside / 'missing.md')
@@ -331,7 +341,7 @@ class StatSignatureTest(unittest.TestCase):
         path = self.write()
         self.settle()
         rolled_back = LegacySyncEngine(self.vault, self.state)
-        path.write_text(path.read_text(encoding='utf-8').replace('Alpha', 'Rolled back'), encoding='utf-8')
+        put(path, get(path).replace('Alpha', 'Rolled back'))
         with self.later():
             rolled_back.sync()
         self.sync_both()
