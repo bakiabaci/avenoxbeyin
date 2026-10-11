@@ -1,4 +1,5 @@
 """Context must refresh source state without lifecycle hooks."""
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -310,20 +311,22 @@ class ContextRefreshTest(unittest.TestCase):
         result = self.run_cli('recap', '--since', '2026-09-20', '--until', '2026-09-24T12:00:00Z')
         self.assertEqual(result.returncode, 0, result.stderr)
         out = json.loads(result.stdout)
-        self.assertEqual(out['from'], '2026-09-20T00:00:00+00:00')
-        self.assertEqual(out['through'], '2026-09-24T12:00:00+00:00')
+        # from/through stay dates, as in the --days window: the local calendar day of each bound.
+        self.assertEqual(out['from'], '2026-09-20')
+        self.assertEqual(out['through'], datetime(2026, 9, 24, 12, tzinfo=timezone.utc).astimezone().date().isoformat())
+        self.assertEqual(out['timezone'], 'local')
 
     def test_invalid_date_exits_cleanly(self):
         result = self.run_cli('recap', '--since', 'invalid-date')
-        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 2)
         self.assertIn('invalid date format', result.stderr)
-        self.assertEqual(result.stdout.strip(), '')
+        self.assertEqual(result.stdout, '')
 
     def test_since_after_until_exits_cleanly(self):
         result = self.run_cli('recap', '--since', '2026-09-20', '--until', '2026-09-10')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('since must be before or equal to until', result.stderr)
-        self.assertEqual(result.stdout.strip(), '')
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('argument --since: must not be after --until', result.stderr)
+        self.assertEqual(result.stdout, '')
 
 
 if __name__=='__main__':unittest.main()
