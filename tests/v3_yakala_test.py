@@ -684,6 +684,18 @@ class YakalaUnitTest(unittest.TestCase):
         self.assertEqual(yakala._gvariant("it's a \\ path"), "'it\\'s a \\\\ path'")
         self.assertEqual(ast.literal_eval(yakala._gvariant('/opt/my py\'s/"x" \\ Ş')), '/opt/my py\'s/"x" \\ Ş')
 
+    def test_linux_gnome_first_and_only_binding(self):
+        entry, calls = self._linux_env('GNOME')  # "@as []": gsettings prints an empty list with its type
+        state = Path(self.tmp.name) / 'state'
+        self.assertIs(yakala.install(self.vault, state)['kisayol_calisiyor'], True)
+        self.assertEqual(self.gnome_list, repr([yakala.GNOME_PATH]))
+        self.assertIs(yakala.status(self.vault, state)['dinleyici_calisiyor'], True)
+        yakala.uninstall(self.vault, state)
+        self.assertEqual(self.gnome_list, '@as []')
+        self.assertIn(['gsettings', 'reset-recursively', yakala._gnome_schema()], calls)
+        self.assertIsNone(yakala.status(self.vault, state)['dinleyici_calisiyor'])
+        self.assertTrue(all(options.get('timeout') and not options.get('shell') for options in self.linux_options))
+
     def test_linux_gnome_unreadable_list_changes_nothing(self):
         entry, calls = self._linux_env('GNOME', "['/org/other/custom0/', 7]")
         done = yakala.install(self.vault, Path(self.tmp.name) / 'state')
