@@ -72,6 +72,13 @@ def clock(seconds):
         yield
 
 
+@contextmanager
+def clock_at(time_ns):
+    """Run a sync at exactly this time, however long the test itself takes."""
+    with patch.object(subject.time, 'time_ns', return_value=time_ns):
+        yield
+
+
 class StatSignatureTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(prefix='beyin-sync-stat-')
@@ -458,22 +465,24 @@ class StatSignatureTest(unittest.TestCase):
         # Timestamps stamped by a clock 10 s behind this machine's, in 2 s ticks: the first write
         # already looks old enough, and the edit lands in its tick. A signature seen once is not
         # trusted; it settles on a read two seconds of this machine's own clock later.
+        start, second = time.time_ns(), 1_000_000_000
         path = self.write()
         with patch.object(subject, '_stat_signature', coarse_signature):
-            for offset, old, new in ((10, None, None), (10.5, b'Alpha', b'Omega'), (11.5, b'Omega', b'Gamma')):
+            for seconds, old, new in ((10, None, None), (10.5, b'Alpha', b'Omega'), (11.5, b'Omega', b'Gamma')):
                 if old:
                     before = path.stat()
                     self.rewrite_same_size(path, old, new)
                     self.put_back(path, before)
-                with clock(offset):
+                # The sync times are pinned: a slow test run must not let the two seconds pass.
+                with clock_at(start + int(seconds * second)):
                     result = self.engine.sync()
                     self.assertEqual(result, self.oracle.sync())
                 self.assertEqual(self.snapshot(self.engine), self.snapshot(self.oracle))
                 self.assert_index_is_fresh()
             self.assertEqual(self.record('note')['text'], 'Gamma calibration.\n')
-            with clock(20):
+            with clock_at(start + 3600 * second):
                 self.engine.sync()
-            with self.reads() as calls, clock(30):
+            with self.reads() as calls, clock_at(start + 7200 * second):
                 self.engine.sync()
             self.assertEqual(calls, [])
 
