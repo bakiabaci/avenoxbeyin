@@ -617,34 +617,132 @@ def run(args):
         write_json(args.out, result)
 
 
+def find_pyspy():
+    """Locate py-spy executable in PATH or Python Scripts/bin folder."""
+    found = shutil.which('py-spy')
+    if found:
+        return found
+    scripts_dir = Path(sys.executable).parent / ('Scripts' if sys.platform == 'win32' else 'bin')
+    pyspy_bin = scripts_dir / ('py-spy.exe' if sys.platform == 'win32' else 'py-spy')
+    if pyspy_bin.is_file():
+        return str(pyspy_bin)
+    return None
+
+
 def profile_run(args):
-    if args.scenario in ('cold_process', 'lock_two_process'):
-        raise ValueError('Choose a sync or hook scenario for an in-process profile')
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='beyin-profile-', dir=args.work_dir) as root:
+    profiler_type = getattr(args, 'profiler', 'cprofile')
+
+    if profiler_type == 'cprofile':
+        if getattr(args, 'vault', None):
+            raise ValueError('--vault is not supported with in-process cprofile; use --profiler py-spy for vault profiling')
+        if args.scenario in ('cold_process', 'lock_two_process'):
+            raise ValueError('Choose a sync or hook scenario for an in-process profile')
+        with tempfile.TemporaryDirectory(prefix='beyin-profile-', dir=args.work_dir) as root:
+            bench = Benchmark(root, args.profile, args.seed, args.scale)
+            with patch.dict(os.environ, bench.env, clear=True):
+                bench.prepare(args.scenario)
+                profiler = cProfile.Profile()
+                tracemalloc.start()
+                try:
+                    profiler.enable()
+                    _, details = bench.action(args.scenario, in_process=True)
+                    profiler.disable()
+                    _, peak = tracemalloc.get_traced_memory()
+                finally:
+                    profiler.disable()
+                    tracemalloc.stop()
+            profiler.dump_stats(str(out / (args.scenario + '.pstats')))
+            text = io.StringIO()
+            pstats.Stats(profiler, stream=text).sort_stats('cumulative').print_stats(40)
+            (out / (args.scenario + '.txt')).write_text(text.getvalue(), encoding='utf-8')
+            write_json(out / (args.scenario + '.json'), dict(schema_version=1, mode='profile',
+                       profiler='cprofile', scenario=args.scenario, tracemalloc_peak_bytes=peak, details=details,
+                       environment=env_info(bench.vault, bench.fixture, 1),
+                       hook_equivalent='in-process main, patched argv/stdin, worker spawning disabled'))
+            print(f'Profile saved to {out}; tracemalloc peak: {peak} bytes', flush=True)
+        return
+
+    # py-spy profiler
+    pyspy_bin = find_pyspy()
+    if not pyspy_bin:
+        raise RuntimeError('py-spy executable not found. Install it with: pip install py-spy')
+
+    fmt = getattr(args, 'format', 'flamegraph')
+    ext = '.svg' if fmt == 'flamegraph' else '.raw' if fmt == 'raw' else '.json'
+
+    # Case 1: Live Vault Profiling
+    if getattr(args, 'vault', None):
+        target_vault = Path(args.vault).resolve()
+        if not target_vault.is_dir() or not (target_vault / 'beyin.py').is_file():
+            raise ValueError(f'Invalid vault directory: {target_vault} (missing beyin.py)')
+        cmd_name = getattr(args, 'command_name', 'sync')
+        target_name = f'vault_{cmd_name}'
+        target_file = out / f"{target_name}{ext}"
+        pyspy_cmd = [pyspy_bin, 'record', '-o', str(target_file), '--rate', str(args.rate), '--format', fmt]
+        if getattr(args, 'idle', False):
+            pyspy_cmd.append('--idle')
+        pyspy_cmd.extend(['--', sys.executable, 'beyin.py', cmd_name])
+        res = subprocess.run(pyspy_cmd, cwd=target_vault, capture_output=True, text=True, encoding='utf-8', timeout=180)
+        output_text = (res.stderr or '') + '\n' + (res.stdout or '')
+        match = re.search(r'Samples:\s*(\d+)', output_text)
+        samples = int(match.group(1)) if match else None
+        errors_match = re.search(r'Errors:\s*(\d+)', output_text)
+        errors = int(errors_match.group(1)) if errors_match else 0
+        meta = dict(schema_version=1, mode='profile', profiler='py-spy', target='live_vault',
+                    vault=str(target_vault), command=cmd_name, output_file=str(target_file.name),
+                    samples=samples, errors=errors, rate=args.rate, format=fmt)
+        write_json(out / f"{target_name}.json", meta)
+        print(f'py-spy profile saved to {target_file}; samples: {samples}, errors: {errors}', flush=True)
+        return
+
+    # Case 2: Synthetic Fixture Scenario Profiling
+    with tempfile.TemporaryDirectory(prefix='beyin-profile-pyspy-', dir=args.work_dir) as root:
         bench = Benchmark(root, args.profile, args.seed, args.scale)
-        with patch.dict(os.environ, bench.env, clear=True):
-            bench.prepare(args.scenario)
-            profiler = cProfile.Profile()
-            tracemalloc.start()
-            try:
-                profiler.enable()
-                _, details = bench.action(args.scenario, in_process=True)
-                profiler.disable()
-                _, peak = tracemalloc.get_traced_memory()
-            finally:
-                profiler.disable()
-                tracemalloc.stop()
-        profiler.dump_stats(str(out / (args.scenario + '.pstats')))
-        text = io.StringIO()
-        pstats.Stats(profiler, stream=text).sort_stats('cumulative').print_stats(40)
-        (out / (args.scenario + '.txt')).write_text(text.getvalue(), encoding='utf-8')
-        write_json(out / (args.scenario + '.json'), dict(schema_version=1, mode='profile',
-                   scenario=args.scenario, tracemalloc_peak_bytes=peak, details=details,
-                   environment=env_info(bench.vault, bench.fixture, 1),
-                   hook_equivalent='in-process main, patched argv/stdin, worker spawning disabled'))
-        print(f'Profile saved to {out}; tracemalloc peak: {peak} bytes', flush=True)
+        bench.prepare(args.scenario)
+        target_file = out / f"{args.scenario}{ext}"
+        repeats = getattr(args, 'iterations', 1)
+        if args.scenario in SYNC_SCENARIOS:
+            sync_repeats = (3 if args.scenario == 'sync_divergent_repeat' else 1) * repeats
+            code = (
+                f"import sys; sys.path.insert(0, {repr(str(bench.vault / '.claude/scripts'))}); "
+                f"import beyin_v3_sync; "
+                f"engine = beyin_v3_sync.SyncEngine({repr(str(bench.vault))}, {repr(str(bench.state))}); "
+                f"[engine.sync() for _ in range({sync_repeats})]"
+            )
+            cmd = [sys.executable, "-c", code]
+            payload = None
+        elif args.scenario.startswith('hook_'):
+            cmd = [sys.executable, str(bench.vault / '.claude/scripts/beyin_v3_hook.py'),
+                   '--vault', str(bench.vault), '--state', str(bench.state), '--harness', 'claude']
+            payload = json.dumps(bench.payload)
+        elif args.scenario == 'cold_process':
+            cmd = [sys.executable, '-c',
+                   f'import sys; sys.path.insert(0, {repr(str(bench.vault / ".claude/scripts"))}); import beyin_v3_hook']
+            payload = None
+        else:
+            raise ValueError(f'Scenario {args.scenario} not supported for py-spy profiling')
+
+        pyspy_cmd = [pyspy_bin, 'record', '-o', str(target_file), '--rate', str(args.rate), '--format', fmt]
+        if getattr(args, 'idle', False):
+            pyspy_cmd.append('--idle')
+        pyspy_cmd.extend(['--', *cmd])
+
+        env = environment(bench.home, nospawn=True)
+        res = subprocess.run(pyspy_cmd, cwd=bench.vault, env=env, input=payload,
+                             capture_output=True, text=True, encoding='utf-8', timeout=180)
+        output_text = (res.stderr or '') + '\n' + (res.stdout or '')
+        match = re.search(r'Samples:\s*(\d+)', output_text)
+        samples = int(match.group(1)) if match else None
+        errors_match = re.search(r'Errors:\s*(\d+)', output_text)
+        errors = int(errors_match.group(1)) if errors_match else 0
+        meta = dict(schema_version=1, mode='profile', profiler='py-spy', scenario=args.scenario,
+                    output_file=str(target_file.name), samples=samples, errors=errors,
+                    rate=args.rate, format=fmt, iterations=repeats,
+                    environment=env_info(bench.vault, bench.fixture, 1))
+        write_json(out / f"{args.scenario}.json", meta)
+        print(f'py-spy profile saved to {target_file}; samples: {samples}, errors: {errors}', flush=True)
 
 
 def report(path):
@@ -674,16 +772,37 @@ def main():
     sub = parser.add_subparsers(dest='command', required=True)
     for command in ('generate', 'run', 'profile'):
         child = sub.add_parser(command)
-        child.add_argument('--profile', choices=PROFILES, required=True)
+        if command != 'profile':
+            child.add_argument('--profile', choices=PROFILES, required=True)
+        else:
+            child.add_argument('--profile', choices=PROFILES, default='active',
+                               help='synthetic fixture size (day1, active, mega, edge; ignored if --vault given)')
         child.add_argument('--out', required=True, type=Path)
         child.add_argument('--seed', type=int, default=233)
         child.add_argument('--scale', type=positive_scale, default=1.0)
         if command != 'generate':
             child.add_argument('--work-dir', type=Path, help='parent of temporary vault (choose filesystem to measure)')
-            child.add_argument('--scenario', choices=SCENARIOS, action='append' if command == 'run' else 'store',
-                               required=command == 'profile', help='repeat flag to select timing blocks')
-        if command == 'run':
-            child.add_argument('--repeat', type=positive_int, default=5)
+            if command == 'run':
+                child.add_argument('--scenario', choices=SCENARIOS, action='append',
+                                   help='repeat flag to select timing blocks')
+                child.add_argument('--repeat', type=positive_int, default=5)
+            elif command == 'profile':
+                child.add_argument('--scenario', choices=SCENARIOS,
+                                   help='scenario to profile (required unless --vault is specified)')
+                child.add_argument('--profiler', choices=('cprofile', 'py-spy'), default='cprofile',
+                                   help='profiler engine to use (default: cprofile)')
+                child.add_argument('--rate', type=positive_int, default=100,
+                                   help='sampling rate (Hz) for py-spy profiler (default: 100)')
+                child.add_argument('--format', choices=('flamegraph', 'raw', 'speedscope'), default='flamegraph',
+                                   help='py-spy output format (default: flamegraph)')
+                child.add_argument('--idle', action='store_true',
+                                   help='sample idle threads in py-spy')
+                child.add_argument('--iterations', type=positive_int, default=1,
+                                   help='repeat workload within process to gather more samples (default: 1)')
+                child.add_argument('--vault', type=Path,
+                                   help='path to existing vault to profile directly instead of synthetic fixture')
+                child.add_argument('--command-name', default='sync',
+                                   help='vault command to profile when --vault is specified (default: sync)')
     sub.add_parser('report').add_argument('results', type=Path)
     internal = sub.add_parser('_lock_worker', help=argparse.SUPPRESS)
     internal.add_argument('vault', type=Path)
@@ -691,6 +810,9 @@ def main():
     internal.add_argument('coordination', type=Path)
     internal.add_argument('role', choices=('first', 'second'))
     args = parser.parse_args()
+    if args.command == 'profile':
+        if not getattr(args, 'vault', None) and not args.scenario:
+            parser.error('profile requires --scenario when --vault is not specified')
     if args.command == 'generate':
         generate(args.out, args.profile, args.seed, args.scale)
     elif args.command == 'run':

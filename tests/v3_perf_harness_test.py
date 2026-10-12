@@ -71,6 +71,31 @@ class PerfHarnessTest(unittest.TestCase):
             self.assertIsInstance(hook['sync_pending'], bool)
             self.assertIn('| sync_cold | 1 |', self.invoke('report', results))
 
+    def test_pyspy_profile_synthetic_and_raw(self):
+        with tempfile.TemporaryDirectory(prefix='v3-perf-pyspy-') as temporary:
+            root = Path(temporary)
+            profile_dir = root / 'profile_out'
+            # Profile synthetic sync scenario with py-spy (flamegraph SVG)
+            output = self.invoke('profile', '--profile', 'day1', '--scale', '0.05',
+                                 '--scenario', 'sync_cold', '--profiler', 'py-spy',
+                                 '--rate', '100', '--iterations', '5', '--out', profile_dir)
+            self.assertIn('py-spy profile saved', output)
+            meta = json.loads((profile_dir / 'sync_cold.json').read_text(encoding='utf-8'))
+            self.assertEqual(meta['profiler'], 'py-spy')
+            self.assertEqual(meta['scenario'], 'sync_cold')
+            self.assertEqual(meta['format'], 'flamegraph')
+            self.assertEqual(meta['errors'], 0)
+            self.assertTrue((profile_dir / 'sync_cold.svg').is_file())
+
+            # Also verify raw format
+            raw_dir = root / 'raw_out'
+            output_raw = self.invoke('profile', '--profile', 'day1', '--scale', '0.05',
+                                     '--scenario', 'sync_cold', '--profiler', 'py-spy',
+                                     '--rate', '100', '--iterations', '5', '--format', 'raw',
+                                     '--out', raw_dir)
+            self.assertIn('py-spy profile saved', output_raw)
+            self.assertTrue((raw_dir / 'sync_cold.raw').is_file())
+
 
 if __name__ == '__main__':
     unittest.main()
