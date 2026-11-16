@@ -293,6 +293,40 @@ def state_location(vault: Path, state: Path, windows=None) -> dict:
     return report
 
 
+def backup_advisory(vault: Path) -> dict:
+    """Local configuration hint only; never contacts remotes or asserts a backup exists."""
+    report = {'status': 'unknown', 'backup_verified': False, 'remote_configured': False,
+              'guide': 'https://github.com/avenoxai/avenoxbeyin/blob/main/docs/v3/BACKUP.md'}
+    env = {key: value for key, value in os.environ.items() if not key.upper().startswith('GIT_')}
+    env.update(GIT_OPTIONAL_LOCKS='0', GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull,
+               GIT_TERMINAL_PROMPT='0', GIT_NO_LAZY_FETCH='1', GIT_ALLOW_PROTOCOL='', LC_ALL='C')
+    command = ['git', '-c', 'core.fsmonitor=false', '-C', str(vault)]
+
+    def run(*args):
+        return subprocess.run(command + list(args), env=env, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2)
+
+    try:
+        inside = run('rev-parse', '--is-inside-work-tree')
+        if inside.returncode:
+            reason = 'not_git_repository' if b'not a git repository' in inside.stderr.lower() else 'git_error'
+            return dict(report, status='unknown' if reason == 'not_git_repository' else 'unavailable', reason=reason)
+        if inside.stdout.strip() != b'true':
+            return dict(report, reason='not_worktree')
+        # Only local config: global remote settings and environment overrides are not vault evidence.
+        # Never return remote names, URLs, stderr or exception messages (they can contain secrets).
+        remotes = run('config', '--local', '--get-regexp', r'^remote\..*\.url$')
+        if remotes.returncode not in (0, 1):
+            return dict(report, status='unavailable', reason='git_config_error')
+        configured = any(len(line.split(None, 1)) == 2 and line.split(None, 1)[1].strip()
+                         for line in remotes.stdout.splitlines())
+        return dict(report, status='remote_configured' if configured else 'unknown',
+                    remote_configured=bool(configured),
+                    reason='remote_not_verified' if configured else 'no_remote_url')
+    except (OSError, subprocess.SubprocessError):
+        return dict(report, status='unavailable', reason='git_unavailable')
+
+
 def receipt_line_endings(vault: Path) -> dict:
     """Report whether git can rewrite receipt line endings in this vault (#205).
 
@@ -583,7 +617,7 @@ def global_bridge_paths(vault: Path, state: Path) -> dict | None:
     A different vault may legitimately own the user's global bridge. Inspect only
     commands explicitly bound to this state; absent or invalid settings stay optional.
     """
-    from beyin_v3_bridge import global_hook_path
+    from beyin_v3_bridge import global_hook_path, global_opencode_settings_path
     here, owner = vault.resolve(), state.resolve()
     expected = (here / '.claude/scripts/beyin_v3_bridge.py').resolve()
     stale, checked = [], 0
@@ -630,6 +664,32 @@ def global_bridge_paths(vault: Path, state: Path) -> dict | None:
                         entry = {'harness': harness, 'event': event, 'reason': reason}
                         if not same and entry not in stale:
                             stale.append(entry)
+    # OpenCode's global bridge is a managed plugin plus a JSON settings file,
+    # rather than a hook command embedded in client settings.
+    try:
+        opencode_settings = global_opencode_settings_path()
+        data = json.loads(opencode_settings.read_text(encoding='utf-8'))
+    except (OSError, ValueError, UnicodeError):
+        data = None
+    if isinstance(data, dict) and data.get('managed_by') == 'beyin-v3-bridge':
+        command = data.get('command')
+        if isinstance(command, list) and all(isinstance(value, str) for value in command):
+            values = {}
+            for flag in ('--state', '--vault'):
+                if command.count(flag) == 1 and command.index(flag) < len(command) - 1:
+                    values[flag] = command[command.index(flag) + 1]
+            script = command[0] if command else None
+            if (isinstance(script, str) and len(values) == 2 and
+                    Path(values['--state']).is_absolute() and
+                    Path(values['--state']).resolve() == owner):
+                checked += 1
+                same_vault = Path(values['--vault']).resolve() == here
+                same_script = (Path(script).resolve() == (here / '.claude/scripts/beyin_v3_bridge.py').resolve()
+                                and Path(script).is_file())
+                for reason, same in (('other_vault', same_vault), ('other_script', same_script)):
+                    entry = {'harness': 'opencode', 'event': 'global', 'reason': reason}
+                    if not same and entry not in stale:
+                        stale.append(entry)
     if not checked:
         return None
     result = {'status': 'stale' if stale else 'ok', 'checked': checked}
@@ -1891,6 +1951,7 @@ def main(argv=None, return_result=False):
                 result['index_exclusions']['always_excluded'] = sorted(sys.modules['beyin_v3_sync'].EXCLUDED_DIRS)
             except Exception as exc:  # never hides the rest of doctor
                 result['index_exclusions'] = {'status': 'unavailable', 'error': type(exc).__name__}
+            result['backup'] = backup_advisory(vault)  # information only; no network, writes or health escalation
             result['receipt_line_endings'] = receipt_line_endings(vault)  # information only: the status below is untouched
             try:  # information only (#585): index size, free pages, leftover temp files; reads only
                 _ensure_scripts_path()
